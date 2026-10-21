@@ -45,18 +45,24 @@ pub struct Preprocessed {
 }
 
 impl Preprocessed {
-    /// Map a network-space box back to source-image pixel coordinates.
-    pub fn to_source_box(&self, x1: f32, y1: f32, x2: f32, y2: f32) -> (f32, f32, f32, f32) {
+    /// Map one network-space point back to source-image pixel coordinates.
+    ///
+    /// This is the per-axis part of [`Self::to_source_box`]: subtract the padding, divide by the
+    /// axis gain, then clip to `[0, src_width]` x `[0, src_height]`. Pose keypoints use it
+    /// directly, so boxes and keypoints land on exactly the same pixel grid.
+    pub fn to_source_point(&self, x: f32, y: f32) -> (f32, f32) {
         let unpad_x = |v: f32| (v - self.pad_x) / self.gain_x;
         let unpad_y = |v: f32| (v - self.pad_y) / self.gain_y;
         let clamp_x = |v: f32| v.clamp(0.0, self.src_width as f32);
         let clamp_y = |v: f32| v.clamp(0.0, self.src_height as f32);
-        (
-            clamp_x(unpad_x(x1)),
-            clamp_y(unpad_y(y1)),
-            clamp_x(unpad_x(x2)),
-            clamp_y(unpad_y(y2)),
-        )
+        (clamp_x(unpad_x(x)), clamp_y(unpad_y(y)))
+    }
+
+    /// Map a network-space box back to source-image pixel coordinates.
+    pub fn to_source_box(&self, x1: f32, y1: f32, x2: f32, y2: f32) -> (f32, f32, f32, f32) {
+        let (x1, y1) = self.to_source_point(x1, y1);
+        let (x2, y2) = self.to_source_point(x2, y2);
+        (x1, y1, x2, y2)
     }
 }
 
@@ -108,6 +114,26 @@ pub fn letterbox_params(src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> Resul
     })
 }
 
+/// Letterbox geometry for a `src_w x src_h` image resized into an `out_w x out_h` canvas.
+///
+/// The returned [`Preprocessed`] carries no tensor: this is what a caller needs to map decoded
+/// network-space output back onto its own pixels when the inference happened outside this
+/// library (see [`crate::detector::Detector::decode_external`]).
+pub fn geometry(src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> Result<Preprocessed> {
+    let lb = letterbox_params(src_w, src_h, out_w, out_h)?;
+    Ok(Preprocessed {
+        tensor: Vec::new(),
+        input_width: out_w,
+        input_height: out_h,
+        src_width: src_w,
+        src_height: src_h,
+        gain_x: lb.gain_x,
+        gain_y: lb.gain_y,
+        pad_x: lb.pad_x as f32,
+        pad_y: lb.pad_y as f32,
+    })
+}
+
 /// Decode `image_path` and letterbox it into network input format.
 pub fn preprocess_file(image_path: &Path, width: u32, height: u32) -> Result<Preprocessed> {
     let path = image_path.to_str().ok_or_else(|| {
@@ -148,6 +174,55 @@ pub fn preprocess_bgr(
         )));
     }
 
+    let mat = bgr_to_mat(data, width, height, width as usize * 3)?;
+    letterbox_mat(&mat, out_w, out_h)
+}
+
+/// Letterbox an interleaved 8-bit BGR buffer whose rows are `row_stride` bytes apart.
+///
+/// The rows are copied one by one into a contiguous matrix, then follow exactly the path of
+/// [`preprocess_bgr`]. `row_stride` must be at least `width * 3`; the bytes between the end of a
+/// row and the start of the next one (e.g. an OpenCV `Mat` whose `step` exceeds `cols * 3`, or a
+/// caller's scanline padding) are ignored.
+pub fn preprocess_bgr_strided(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    row_stride: usize,
+    out_w: u32,
+    out_h: u32,
+) -> Result<Preprocessed> {
+    if width == 0 || height == 0 {
+        return Err(Error::invalid(format!(
+            "invalid source size: {width}x{height}"
+        )));
+    }
+    let row_bytes = (width as usize)
+        .checked_mul(3)
+        .ok_or_else(|| Error::invalid("image size overflows usize"))?;
+    if row_stride < row_bytes {
+        return Err(Error::invalid(format!(
+            "row stride {row_stride} is smaller than one {width}px BGR row ({row_bytes} bytes)"
+        )));
+    }
+    let required = (height as usize - 1)
+        .checked_mul(row_stride)
+        .and_then(|offset| offset.checked_add(row_bytes))
+        .ok_or_else(|| Error::invalid("image size overflows usize"))?;
+    if data.len() < required {
+        return Err(Error::invalid(format!(
+            "bgr buffer holds {} bytes, need {required} for {width}x{height} with stride {row_stride}",
+            data.len()
+        )));
+    }
+
+    let mat = bgr_to_mat(data, width, height, row_stride)?;
+    letterbox_mat(&mat, out_w, out_h)
+}
+
+/// Copy a (possibly strided) BGR8 buffer into a contiguous `height x width` matrix.
+fn bgr_to_mat(data: &[u8], width: u32, height: u32, row_stride: usize) -> Result<Mat> {
+    let row_bytes = width as usize * 3;
     let mut mat = Mat::new_rows_cols_with_default(
         height as i32,
         width as i32,
@@ -155,11 +230,19 @@ pub fn preprocess_bgr(
         Scalar::new(0.0, 0.0, 0.0, 0.0),
     )
     .map_err(|e| Error::OpenCv(format!("cannot allocate {width}x{height} Mat: {e}").into()))?;
-    mat.data_bytes_mut()
-        .map_err(|e| Error::OpenCv(format!("cannot access Mat storage: {e}").into()))?
-        .copy_from_slice(&data[..expected]);
-
-    letterbox_mat(&mat, out_w, out_h)
+    let storage = mat
+        .data_bytes_mut()
+        .map_err(|e| Error::OpenCv(format!("cannot access Mat storage: {e}").into()))?;
+    if row_stride == row_bytes {
+        storage.copy_from_slice(&data[..row_bytes * height as usize]);
+    } else {
+        for row in 0..height as usize {
+            let from = row * row_stride;
+            let to = row * row_bytes;
+            storage[to..to + row_bytes].copy_from_slice(&data[from..from + row_bytes]);
+        }
+    }
+    Ok(mat)
 }
 
 /// Resize + pad `src` and pack it into an NCHW f32 RGB tensor.

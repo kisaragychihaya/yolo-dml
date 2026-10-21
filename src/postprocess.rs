@@ -6,8 +6,13 @@
 //! [`decode_and_nms`]). A third layout — the four-tensor `torchvision` style export
 //! (`num_detections`, `detection_boxes`, `detection_scores`, `detection_classes`, NMS baked
 //! into the graph) — is decoded by [`decode_nms_applied`].
+//!
+//! Pose models reuse those layouts with keypoint channels appended: the standard export becomes
+//! `1 x (4 + nc + K*D) x anchors` ([`decode_pose`]) and the end-to-end one `1 x N x (6 + K*D)`
+//! ([`decode_pose_end2end`]). Both share the box NMS of the detect path — the keypoints of a
+//! surviving candidate are carried along by its index (see [`nms_indices`]).
 
-use crate::detector::Detection;
+use crate::detector::{Detection, Keypoint};
 use crate::error::{Error, Result};
 use crate::preprocess::Preprocessed;
 
@@ -19,6 +24,48 @@ pub const MAX_DET: usize = 300;
 
 /// Column count of an end-to-end (`NMS already applied`) output row: `x1 y1 x2 y2 conf cls`.
 const END2END_COLUMNS: usize = 6;
+
+/// Keypoint layout of a pose model, parsed from the `kpt_shape` custom metadata.
+///
+/// Ultralytics stores it as the Python `repr` of a tuple, e.g. `"(17, 3)"`: 17 COCO person
+/// keypoints with `(x, y, visibility)` each. A `(K, 2)` shape carries just `(x, y)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KptShape {
+    /// Number of keypoints per detection (`K`).
+    pub count: usize,
+    /// Values per keypoint (`D`): 2 (`x y`) or 3 (`x y visibility`).
+    pub dim: usize,
+}
+
+impl KptShape {
+    /// COCO person keypoints (`kpt_shape` `(17, 3)`).
+    pub const COCO: Self = Self { count: 17, dim: 3 };
+
+    /// Number of output channels the keypoints occupy (`K * D`).
+    pub const fn channels(self) -> usize {
+        self.count * self.dim
+    }
+
+    /// Parse the `kpt_shape` metadata, tolerating tuple/list reprs and stray whitespace.
+    ///
+    /// `"(17, 3)"`, `"[17,3]"`, `"17, 3"` all read as 17 keypoints of 3 values; anything that
+    /// does not yield exactly two positive numbers with `dim` in `2..=3` is rejected so that a
+    /// malformed metadata entry falls back to the shape heuristics instead of mis-decoding.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let numbers: Vec<usize> = raw
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        match numbers.as_slice() {
+            [count, dim] if *count > 0 && (2..=3).contains(dim) => Some(Self {
+                count: *count,
+                dim: *dim,
+            }),
+            _ => None,
+        }
+    }
+}
 
 /// `ultralytics` `max_wh`: boxes are shifted by `class_id * 7680` before NMS so that boxes
 /// of different classes never suppress each other while a single NMS pass suffices.
@@ -148,18 +195,29 @@ impl Candidate {
 /// `area_a + area_b - inter` union and the same `union <= 0` guard, on the same shifted
 /// coordinates. The array-of-structs version stays the executable definition of those semantics.
 pub fn nms(candidates: &[Candidate], iou_threshold: f32, max_det: usize) -> Vec<Candidate> {
+    nms_indices(candidates, iou_threshold, max_det)
+        .into_iter()
+        .map(|index| candidates[index])
+        .collect()
+}
+
+/// [`nms`], returning the *positions* of the kept candidates in descending confidence order.
+///
+/// This is the same scan as [`nms`] (which is a thin mapping over it); the pose decoders need it
+/// because a candidate's keypoints live in a parallel array and must follow it through NMS.
+pub fn nms_indices(candidates: &[Candidate], iou_threshold: f32, max_det: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..candidates.len()).collect();
     order.sort_by(|&a, &b| candidates[b].confidence.total_cmp(&candidates[a].confidence));
-    nms_ordered(candidates, &order, iou_threshold, max_det)
+    nms_ordered_indices(candidates, &order, iou_threshold, max_det)
 }
 
 /// [`nms`] body, with the confidence ordering already computed.
-fn nms_ordered(
+fn nms_ordered_indices(
     candidates: &[Candidate],
     order: &[usize],
     iou_threshold: f32,
     max_det: usize,
-) -> Vec<Candidate> {
+) -> Vec<usize> {
     let count = order.len();
     let mut x1 = Vec::with_capacity(count);
     let mut y1 = Vec::with_capacity(count);
@@ -193,12 +251,12 @@ fn nms_ordered(
     );
 
     let mut suppressed = vec![0u8; count];
-    let mut kept: Vec<Candidate> = Vec::new();
+    let mut kept: Vec<usize> = Vec::new();
     for rank in 0..count {
         if suppressed[rank] != 0 {
             continue;
         }
-        kept.push(candidates[order[rank]]);
+        kept.push(order[rank]);
         if kept.len() >= max_det {
             break;
         }
@@ -289,6 +347,7 @@ pub fn decode_end2end(
             confidence: row[4],
             class_id,
             class_name: class_name(class_names, None, class_id),
+            keypoints: None,
         });
     }
     Ok(detections)
@@ -381,6 +440,7 @@ pub fn decode_nms_applied<C: ClassIndex>(
             confidence,
             class_id,
             class_name: class_name(class_names, None, class_id),
+            keypoints: None,
         });
     }
     detections.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
@@ -462,12 +522,223 @@ pub fn decode_and_nms(
                 confidence: c.confidence,
                 class_id: c.class_id,
                 class_name: class_name(class_names, Some(class_count), c.class_id),
+                keypoints: None,
             }
         })
         .collect())
 }
 
-/// Decode whichever layout the model produced.
+/// Decode one run of `K*D` network-space keypoint values into source-image keypoints.
+///
+/// `values` is `[x0, y0(, v0), x1, y1(, v1), ...]`; the visibility is already sigmoid'd by the
+/// exporter and is passed through unchanged. `x`/`y` get the same de-padding, gain division and
+/// clipping as [`Preprocessed::to_source_box`].
+fn keypoints_from_network(pre: &Preprocessed, kpt: KptShape, values: &[f32]) -> Vec<Keypoint> {
+    values
+        .chunks_exact(kpt.dim)
+        .map(|point| {
+            let (x, y) = pre.to_source_point(point[0], point[1]);
+            Keypoint {
+                x,
+                y,
+                visibility: if kpt.dim >= 3 { Some(point[2]) } else { None },
+            }
+        })
+        .collect()
+}
+
+/// Decode the standard pose export: `1 x (4 + nc + K*D) x anchors`.
+///
+/// The first `4` channels are the box in `cx cy w h` form, the next `nc` ones the class scores
+/// (the best one is the confidence, exactly like [`decode_and_nms`]) and the remaining `K*D` the
+/// keypoints: `x`, `y` in network-canvas pixels and, for `D == 3`, the sigmoid'd visibility.
+///
+/// Keypoints are mapped to source-image pixels and clipped *before* NMS, and they follow their
+/// candidate through the suppression by index, so a kept box always carries its own keypoints.
+pub fn decode_pose(
+    raw: &[f32],
+    shape: &[i64],
+    pre: &Preprocessed,
+    class_names: &[String],
+    conf_threshold: f32,
+    iou_threshold: f32,
+    kpt: KptShape,
+) -> Result<Vec<Detection>> {
+    let (channels, anchors) = match shape {
+        [_, channels, anchors] if *anchors > 0 => (*channels as usize, *anchors as usize),
+        _ => {
+            return Err(Error::invalid(format!(
+                "unexpected output shape {shape:?} for the pose decoder"
+            )))
+        }
+    };
+    let kpt_channels = kpt.channels();
+    if kpt.count == 0 || kpt.dim < 2 {
+        return Err(Error::invalid(format!(
+            "unusable keypoint shape: {} keypoints of dim {}",
+            kpt.count, kpt.dim
+        )));
+    }
+    if channels < 5 + kpt_channels {
+        return Err(Error::invalid(format!(
+            "pose output has {channels} channels, need at least {} for {} keypoints of dim {}",
+            5 + kpt_channels,
+            kpt.count,
+            kpt.dim
+        )));
+    }
+    let class_count = channels - 4 - kpt_channels;
+    if raw.len() < channels * anchors {
+        return Err(Error::invalid(format!(
+            "output holds {} values, need {} for shape {shape:?}",
+            raw.len(),
+            channels * anchors
+        )));
+    }
+
+    // Channel-major layout, as in `decode_and_nms`: attribute row `c` starts at `c * anchors`.
+    // The keypoints of candidate `i` occupy `points[i * K .. (i + 1) * K]`.
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut points: Vec<Keypoint> = Vec::new();
+    for anchor in 0..anchors {
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_class = 0usize;
+        for class in 0..class_count {
+            let score = raw[(4 + class) * anchors + anchor];
+            if score > best_score {
+                best_score = score;
+                best_class = class;
+            }
+        }
+        if !(best_score > conf_threshold) {
+            continue;
+        }
+        let (x1, y1, x2, y2) = xywh2xyxy(
+            raw[anchor],
+            raw[anchors + anchor],
+            raw[2 * anchors + anchor],
+            raw[3 * anchors + anchor],
+        );
+        candidates.push(Candidate {
+            x1,
+            y1,
+            x2,
+            y2,
+            confidence: best_score,
+            class_id: best_class as i32,
+        });
+        for point in 0..kpt.count {
+            let base = (4 + class_count + point * kpt.dim) * anchors + anchor;
+            let (x, y) = pre.to_source_point(raw[base], raw[base + anchors]);
+            points.push(Keypoint {
+                x,
+                y,
+                visibility: if kpt.dim >= 3 {
+                    Some(raw[base + 2 * anchors])
+                } else {
+                    None
+                },
+            });
+        }
+    }
+
+    let kept = nms_indices(&candidates, iou_threshold, MAX_DET);
+    Ok(kept
+        .into_iter()
+        .map(|index| {
+            let candidate = candidates[index];
+            let (x1, y1, x2, y2) =
+                pre.to_source_box(candidate.x1, candidate.y1, candidate.x2, candidate.y2);
+            Detection {
+                x1,
+                y1,
+                x2,
+                y2,
+                confidence: candidate.confidence,
+                class_id: candidate.class_id,
+                class_name: class_name(class_names, Some(class_count), candidate.class_id),
+                keypoints: Some(points[index * kpt.count..(index + 1) * kpt.count].to_vec()),
+            }
+        })
+        .collect())
+}
+
+/// Decode the end-to-end pose export: `1 x N x (6 + K*D)` rows of
+/// `x1 y1 x2 y2 confidence class_id keypoints`.
+///
+/// The graph already ran NMS and sorted the rows by descending confidence, so this only filters
+/// by confidence and caps at [`MAX_DET`] — the same contract as [`decode_end2end`], with the
+/// keypoints appended to each row (ultralytics inserts the `cls` column inside NMS, i.e. before
+/// the keypoints).
+pub fn decode_pose_end2end(
+    raw: &[f32],
+    pre: &Preprocessed,
+    class_names: &[String],
+    conf_threshold: f32,
+    kpt: KptShape,
+) -> Result<Vec<Detection>> {
+    if kpt.count == 0 || kpt.dim < 2 {
+        return Err(Error::invalid(format!(
+            "unusable keypoint shape: {} keypoints of dim {}",
+            kpt.count, kpt.dim
+        )));
+    }
+    let row_len = END2END_COLUMNS + kpt.channels();
+    if raw.len() % row_len != 0 {
+        return Err(Error::invalid(format!(
+            "end2end pose output has {} values, not a multiple of {row_len} (6 + {}*{})",
+            raw.len(),
+            kpt.count,
+            kpt.dim
+        )));
+    }
+
+    let mut detections = Vec::new();
+    for row in raw.chunks_exact(row_len) {
+        if !(row[4] > conf_threshold) {
+            continue;
+        }
+        if detections.len() >= MAX_DET {
+            break;
+        }
+        let (x1, y1, x2, y2) = pre.to_source_box(row[0], row[1], row[2], row[3]);
+        let class_id = row[5].round() as i32;
+        detections.push(Detection {
+            x1,
+            y1,
+            x2,
+            y2,
+            confidence: row[4],
+            class_id,
+            class_name: class_name(class_names, None, class_id),
+            keypoints: Some(keypoints_from_network(pre, kpt, &row[END2END_COLUMNS..])),
+        });
+    }
+    Ok(detections)
+}
+
+/// Keypoint layout implied by the output shape alone, for models whose metadata carries no
+/// `kpt_shape`.
+///
+/// Only the two COCO person layouts are recognised: the standard `(1, 56, A)`
+/// (`4 + 1 + 17*3`) and the end-to-end `(1, N, 57)` (`6 + 17*3`). Any other pose export needs
+/// the metadata — guessing `K`/`D` from a shape would decode noise.
+fn infer_kpt_shape(shape: &[i64]) -> Option<KptShape> {
+    match shape {
+        [_, channels, _] if *channels == (4 + 1 + KptShape::COCO.channels()) as i64 => {
+            Some(KptShape::COCO)
+        }
+        [_, _, last] if *last == (END2END_COLUMNS + KptShape::COCO.channels()) as i64 => {
+            Some(KptShape::COCO)
+        }
+        _ => None,
+    }
+}
+
+/// Decode whichever detect layout the model produced.
+///
+/// [`decode_output_with_kpt`] is the same dispatch with pose support; this entry point is kept
+/// for detect-only callers (and stays the definition of the detect routing).
 pub fn decode_output(
     raw: &[f32],
     shape: &[i64],
@@ -492,6 +763,54 @@ pub fn decode_output(
         _ => Err(Error::invalid(format!(
             "unsupported output shape {shape:?}; expected a 3-D (batch, channels, anchors) tensor"
         ))),
+    }
+}
+
+/// Decode whichever layout the model produced, pose models included.
+///
+/// `kpt` is the model's `kpt_shape` metadata ([`KptShape::parse`]); `None` means "not declared"
+/// and falls back to [`infer_kpt_shape`]. Routing, in order:
+///
+/// * `kpt` known and the last dimension is `6 + K*D` → end-to-end pose
+///   ([`decode_pose_end2end`]);
+/// * `kpt` known otherwise → standard pose ([`decode_pose`]);
+/// * `kpt` unknown → the detect routing of [`decode_output`] (last dimension `6` → end-to-end,
+///   anything else 3-D → standard).
+///
+/// A standard pose tensor whose anchor count happens to equal `6 + K*D` is read as end-to-end —
+/// that would need 8..=57 anchors, which no real export has.
+pub fn decode_output_with_kpt(
+    raw: &[f32],
+    shape: &[i64],
+    pre: &Preprocessed,
+    class_names: &[String],
+    conf_threshold: f32,
+    iou_threshold: f32,
+    kpt: Option<KptShape>,
+) -> Result<Vec<Detection>> {
+    let kpt = kpt.or_else(|| infer_kpt_shape(shape));
+    let last = match shape {
+        [_, _, last] => *last,
+        _ => {
+            return Err(Error::invalid(format!(
+                "unsupported output shape {shape:?}; expected a 3-D (batch, channels, anchors) tensor"
+            )))
+        }
+    };
+    match kpt {
+        Some(kpt) if last == (END2END_COLUMNS + kpt.channels()) as i64 => {
+            decode_pose_end2end(raw, pre, class_names, conf_threshold, kpt)
+        }
+        Some(kpt) => decode_pose(
+            raw,
+            shape,
+            pre,
+            class_names,
+            conf_threshold,
+            iou_threshold,
+            kpt,
+        ),
+        None => decode_output(raw, shape, pre, class_names, conf_threshold, iou_threshold),
     }
 }
 
@@ -885,5 +1204,305 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn kpt_shape_parses_python_reprs() {
+        assert_eq!(KptShape::parse("(17, 3)"), Some(KptShape::COCO));
+        assert_eq!(KptShape::parse("(17,3)"), Some(KptShape::COCO));
+        assert_eq!(KptShape::parse("[17,3]"), Some(KptShape::COCO));
+        assert_eq!(KptShape::parse(" 17 , 3 "), Some(KptShape::COCO));
+        assert_eq!(
+            KptShape::parse("(4, 2)"),
+            Some(KptShape {
+                count: 4,
+                dim: 2
+            })
+        );
+        assert_eq!(KptShape::COCO.channels(), 51);
+
+        // anything that is not exactly two usable numbers is rejected
+        assert_eq!(KptShape::parse(""), None);
+        assert_eq!(KptShape::parse("(17)"), None);
+        assert_eq!(KptShape::parse("person"), None);
+        assert_eq!(KptShape::parse("(0, 3)"), None);
+        assert_eq!(KptShape::parse("(17, 1)"), None);
+        assert_eq!(KptShape::parse("(17, 4)"), None);
+    }
+
+    #[test]
+    fn nms_indices_match_nms_output() {
+        for seed in 0..3u64 {
+            let candidates = synthetic_candidates(seed, 200);
+            for max_det in [5usize, MAX_DET] {
+                let kept = nms(&candidates, 0.45, max_det);
+                let indices = nms_indices(&candidates, 0.45, max_det);
+                let mapped: Vec<Candidate> =
+                    indices.iter().map(|&index| candidates[index]).collect();
+                assert_eq!(mapped, kept, "seed {seed}, max_det {max_det}");
+            }
+        }
+        assert!(nms_indices(&[], 0.7, MAX_DET).is_empty());
+    }
+
+    /// `2` keypoints of `3` values each, `1` class: `1 x 11 x anchors`.
+    fn pose_standard_inputs() -> (Vec<f32>, usize, usize) {
+        let anchors = 3usize;
+        let kpt = KptShape { count: 2, dim: 3 };
+        let channels = 4 + 1 + kpt.channels();
+        let mut raw = vec![0f32; channels * anchors];
+        let mut write = |anchor: usize, cx: f32, cy: f32, conf: f32, points: [(f32, f32, f32); 2]| {
+            let rows = [cx, cy, 40.0, 40.0];
+            for (row, value) in rows.iter().enumerate() {
+                raw[row * anchors + anchor] = *value;
+            }
+            raw[4 * anchors + anchor] = conf;
+            for (point, (x, y, v)) in points.iter().enumerate() {
+                let base = (5 + point * 3) * anchors + anchor;
+                raw[base] = *x;
+                raw[base + anchors] = *y;
+                raw[base + 2 * anchors] = *v;
+            }
+        };
+        // anchor 0 (kept, conf 0.9) overlaps anchor 1 (suppressed, conf 0.8);
+        // anchor 2 (kept, conf 0.3) sits elsewhere.
+        write(0, 100.0, 100.0, 0.9, [(100.0, 100.0, 0.1), (120.0, 120.0, 0.2)]);
+        write(1, 105.0, 100.0, 0.8, [(400.0, 400.0, 0.9), (420.0, 420.0, 0.8)]);
+        write(2, 400.0, 400.0, 0.3, [(500.0, 500.0, 0.5), (520.0, 520.0, 0.6)]);
+        (raw, channels, anchors)
+    }
+
+    #[test]
+    fn decode_pose_keeps_keypoints_of_the_surviving_candidates() {
+        let pre = letterboxed_pre();
+        let (raw, channels, anchors) = pose_standard_inputs();
+        let kpt = KptShape { count: 2, dim: 3 };
+        let dets = decode_pose(
+            &raw,
+            &[1, channels as i64, anchors as i64],
+            &pre,
+            &[],
+            0.25,
+            0.7,
+            kpt,
+        )
+        .unwrap();
+        assert_eq!(dets.len(), 2, "{dets:?}");
+        assert!((dets[0].confidence - 0.9).abs() < 1e-6);
+        assert!((dets[1].confidence - 0.3).abs() < 1e-6);
+        assert_eq!(dets[0].class_id, 0);
+        // one class and no `names` metadata: the built-in COCO table only applies to 80-class
+        // models, so the name falls back to `class_<id>`
+        assert_eq!(dets[0].class_name, "class_0");
+
+        // The keypoints must be the ones of the *kept* candidate (100, 100) / (120, 120),
+        // not the suppressed overlapping one at (400, 400), mapped back through the letterbox
+        // (gain_x 0.5, gain_y 0.375) and clipped to the 320x240 source.
+        let first = dets[0].keypoints.as_ref().expect("pose detections carry keypoints");
+        assert_eq!(first.len(), 2);
+        assert!((first[0].x - 200.0).abs() < 1e-3, "{first:?}");
+        assert!((first[0].y - 240.0).abs() < 1e-3, "{first:?}"); // 100/0.375 clips to 240
+        assert_eq!(first[0].visibility, Some(0.1));
+        assert!((first[1].x - 240.0).abs() < 1e-3, "{first:?}");
+        assert!((first[1].y - 240.0).abs() < 1e-3, "{first:?}"); // 320 clips to 240
+        assert_eq!(first[1].visibility, Some(0.2));
+
+        // x beyond the source width clamps on the right edge
+        let second = dets[1].keypoints.as_ref().expect("pose detections carry keypoints");
+        assert!((second[0].x - 320.0).abs() < 1e-3, "{second:?}");
+        assert!((second[0].y - 240.0).abs() < 1e-3, "{second:?}");
+        assert_eq!(second[1].visibility, Some(0.6));
+    }
+
+    #[test]
+    fn decode_pose_supports_kpt_dim_two() {
+        let pre = letterboxed_pre();
+        let kpt = KptShape { count: 2, dim: 2 };
+        let anchors = 1usize;
+        let channels = 4 + 1 + kpt.channels();
+        let mut raw = vec![0f32; channels * anchors];
+        // one box at (100, 75) with cm size 40x40, conf 0.8, two (x, y) keypoints
+        raw[0] = 100.0;
+        raw[anchors] = 75.0;
+        raw[2 * anchors] = 40.0;
+        raw[3 * anchors] = 40.0;
+        raw[4 * anchors] = 0.8;
+        raw[5 * anchors] = 100.0;
+        raw[6 * anchors] = 75.0;
+        raw[7 * anchors] = 125.0;
+        raw[8 * anchors] = 150.0;
+
+        let dets = decode_pose(&raw, &[1, channels as i64, anchors as i64], &pre, &[], 0.25, 0.7, kpt)
+            .unwrap();
+        assert_eq!(dets.len(), 1, "{dets:?}");
+        let points = dets[0].keypoints.as_ref().unwrap();
+        assert_eq!(points.len(), 2);
+        assert!(points.iter().all(|point| point.visibility.is_none()), "{points:?}");
+        assert!((points[0].x - 200.0).abs() < 1e-3, "{points:?}");
+        assert!((points[0].y - 200.0).abs() < 1e-3, "{points:?}");
+        assert!((points[1].x - 250.0).abs() < 1e-3, "{points:?}");
+        assert!((points[1].y - 240.0).abs() < 1e-3, "{points:?}"); // 150/0.375 = 400 -> clipped
+    }
+
+    #[test]
+    fn decode_pose_end2end_filters_and_preserves_order() {
+        let pre = letterboxed_pre();
+        let kpt = KptShape { count: 2, dim: 3 };
+        let row_len = END2END_COLUMNS + kpt.channels();
+        let mut raw = vec![0f32; 4 * row_len];
+        let rows = [
+            (0usize, (10.0f32, 20.0, 30.0, 40.0), 0.9f32, 0.0f32),
+            (1, (100.0, 200.0, 130.0, 240.0), 0.1, 5.0), // below threshold
+            (2, (50.0, 60.0, 70.0, 80.0), 0.5, 2.0),
+            (3, (5.0, 6.0, 7.0, 8.0), 0.3, 7.0),
+        ];
+        for (row, (x1, y1, x2, y2), conf, class) in rows {
+            let base = row * row_len;
+            raw[base] = x1;
+            raw[base + 1] = y1;
+            raw[base + 2] = x2;
+            raw[base + 3] = y2;
+            raw[base + 4] = conf;
+            raw[base + 5] = class;
+            // keypoints: (x, y, v) triples derived from the row so mixups are visible
+            for point in 0..kpt.count {
+                let offset = base + END2END_COLUMNS + point * 3;
+                raw[offset] = 20.0 * (row + point) as f32;
+                raw[offset + 1] = 10.0 * (row + point) as f32;
+                raw[offset + 2] = 0.5 + 0.1 * point as f32;
+            }
+        }
+
+        let dets = decode_pose_end2end(&raw, &pre, &[], 0.25, kpt).unwrap();
+        assert_eq!(dets.len(), 3, "{dets:?}");
+        assert_eq!(
+            dets.iter().map(|d| d.class_id).collect::<Vec<_>>(),
+            vec![0, 2, 7]
+        );
+        // no `names` metadata: ids < 80 fall back to the built-in COCO table
+        assert_eq!(dets[0].class_name, "person");
+        assert_eq!(dets[1].class_name, "car");
+        assert_eq!((dets[0].x1, dets[0].y1), (20.0, 20.0 / 0.375));
+        let points = dets[1].keypoints.as_ref().unwrap();
+        assert_eq!(points.len(), 2);
+        assert!((points[0].x - 80.0).abs() < 1e-3, "{points:?}"); // 20 * row 2 / gain 0.5
+        assert!((points[0].y - 20.0 / 0.375).abs() < 1e-3, "{points:?}"); // 10 * row 2
+        assert_eq!(points[0].visibility, Some(0.5));
+        assert_eq!(points[1].visibility, Some(0.6));
+
+        // a tensor that is not a whole number of rows is rejected
+        assert!(decode_pose_end2end(&raw[..row_len - 1], &pre, &[], 0.25, kpt).is_err());
+    }
+
+    #[test]
+    fn decode_pose_rejects_shapes_without_room_for_keypoints() {
+        let pre = identity_pre();
+        let kpt = KptShape::COCO;
+        // 56 channels fit 17x3 keypoints and one class; 50 do not
+        assert!(decode_pose(&vec![0f32; 50 * 2], &[1, 50, 2], &pre, &[], 0.25, 0.7, kpt).is_err());
+        assert!(
+            decode_pose(&vec![0f32; 56 * 2], &[1, 56, 2], &pre, &[], 0.25, 0.7, kpt)
+                .unwrap()
+                .is_empty()
+        );
+        // not 3-D
+        assert!(decode_pose(&[], &[1, 56], &pre, &[], 0.25, 0.7, kpt).is_err());
+    }
+
+    #[test]
+    fn decode_output_routes_pose_by_metadata_and_shape() {
+        let pre = identity_pre();
+        let coco = KptShape::COCO;
+        let end2end_row = 6 + coco.channels();
+
+        // metadata says (17, 3) and the last dimension is 6 + 17*3 -> end-to-end pose
+        let mut raw = vec![0f32; 2 * end2end_row];
+        raw[0] = 10.0;
+        raw[1] = 20.0;
+        raw[2] = 30.0;
+        raw[3] = 40.0;
+        raw[4] = 0.9;
+        raw[5] = 1.0;
+        raw[6] = 10.0; // first keypoint x
+        raw[7] = 20.0; // first keypoint y
+        raw[8] = 0.7; // first keypoint v
+        let dets =
+            decode_output_with_kpt(&raw, &[1, 2, end2end_row as i64], &pre, &[], 0.25, 0.7, Some(coco))
+                .unwrap();
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].class_id, 1);
+        let points = dets[0].keypoints.as_ref().unwrap();
+        assert_eq!(points.len(), coco.count);
+        assert_eq!((points[0].x, points[0].y), (10.0, 20.0));
+        assert_eq!(points[0].visibility, Some(0.7));
+        assert_eq!(points[16].visibility, Some(0.0)); // padded row values
+
+        // metadata says (17, 3) and the last dimension is the anchor count -> standard pose
+        let anchors = 2usize;
+        let mut raw = vec![0f32; 56 * anchors];
+        raw[0] = 100.0;
+        raw[anchors] = 100.0;
+        raw[2 * anchors] = 20.0;
+        raw[3 * anchors] = 20.0;
+        raw[4 * anchors] = 0.9; // the single class score
+        raw[5 * anchors] = 50.0; // keypoint 0 x
+        raw[6 * anchors] = 60.0; // keypoint 0 y
+        raw[7 * anchors] = 0.4; // keypoint 0 v
+        let dets =
+            decode_output_with_kpt(&raw, &[1, 56, anchors as i64], &pre, &[], 0.25, 0.7, Some(coco))
+                .unwrap();
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].keypoints.as_ref().unwrap()[0].x, 50.0);
+
+        // no metadata: both COCO pose shapes are recognised ...
+        let dets =
+            decode_output_with_kpt(&raw, &[1, 56, anchors as i64], &pre, &[], 0.25, 0.7, None)
+                .unwrap();
+        assert_eq!(dets.len(), 1);
+        assert!(dets[0].keypoints.is_some());
+        let mut raw = vec![0f32; 2 * end2end_row];
+        raw[4] = 0.9;
+        let dets = decode_output_with_kpt(
+            &raw,
+            &[1, 2, end2end_row as i64],
+            &pre,
+            &[],
+            0.25,
+            0.7,
+            None,
+        )
+        .unwrap();
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].keypoints.as_ref().unwrap().len(), 17);
+
+        // ... while a shape that declares nothing stays a detect model
+        let mut raw = vec![0f32; 6 * anchors];
+        raw[0] = 100.0;
+        raw[anchors] = 100.0;
+        raw[2 * anchors] = 20.0;
+        raw[3 * anchors] = 20.0;
+        raw[4 * anchors] = 0.9;
+        let dets =
+            decode_output_with_kpt(&raw, &[1, 6, anchors as i64], &pre, &[], 0.25, 0.7, None)
+                .unwrap();
+        assert_eq!(dets.len(), 1);
+        assert!(dets[0].keypoints.is_none());
+
+        // metadata wins over the shape heuristic: (4, 2) keypoints need 4+1+8 channels
+        let kpt = KptShape { count: 4, dim: 2 };
+        let anchors = 1usize;
+        let mut raw = vec![0f32; 13 * anchors];
+        raw[0] = 100.0;
+        raw[anchors] = 100.0;
+        raw[2 * anchors] = 20.0;
+        raw[3 * anchors] = 20.0;
+        raw[4 * anchors] = 0.9;
+        let dets =
+            decode_output_with_kpt(&raw, &[1, 13, anchors as i64], &pre, &[], 0.25, 0.7, Some(kpt))
+                .unwrap();
+        assert_eq!(dets.len(), 1);
+        let points = dets[0].keypoints.as_ref().unwrap();
+        assert_eq!(points.len(), 4);
+        assert!(points.iter().all(|point| point.visibility.is_none()));
     }
 }

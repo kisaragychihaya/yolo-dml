@@ -46,3 +46,11 @@ jobs:
 
       - name: Compare zidane.jpg against the Python reference
         run: py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_zidane.json assets/reference_zidane.json
+
+      - name: Demo pose (ctypes end-to-end)
+        run: py/.venv/Scripts/python.exe examples/demo.py --release --pose
+
+      - name: Compare pose outputs against the Python reference
+        run: |
+          py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_pose_bus.json assets/reference_pose_bus.json
+          py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_pose_zidane.json assets/reference_pose_zidane.json

@@ -1,15 +1,18 @@
 <#
 .SYNOPSIS
-    Fetch the test images and the ONNX model that yolo_dml's tests and demo need.
+    Fetch the test images and the ONNX models that yolo_dml's tests and demo need.
 
 .DESCRIPTION
     The repository does not redistribute Ultralytics' sample images or the exported
-    model (see README), so this script fetches them:
+    models (see README), so this script fetches them:
 
       assets/bus.jpg, assets/zidane.jpg   ultralytics/assets release v0.0.0
                                           (gh CLI first, plain curl fallback)
       yolo26n.onnx                        exported locally from yolo26n.pt with the
                                           `ultralytics` package inside py/.venv
+      yolo26n-pose.onnx                   same, from yolo26n-pose.pt (pose model; the
+                                          detect tests do not need it, the pose tests
+                                          and `examples/demo.py --pose` do)
 
     Idempotent: existing files are skipped, and torch / ultralytics are only installed
     when the venv does not already provide them.
@@ -35,8 +38,9 @@ $AssetsDir = Join-Path $RepoRoot 'assets'
 $VenvDir = Join-Path $RepoRoot 'py\.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $VenvYolo = Join-Path $VenvDir 'Scripts\yolo.exe'
-$ModelPath = Join-Path $RepoRoot 'yolo26n.onnx'
 $ImageNames = @('bus.jpg', 'zidane.jpg')
+# Model names, exported as "<name>.onnx" from "<name>.pt" into the repository root.
+$ModelNames = @('yolo26n', 'yolo26n-pose')
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -188,16 +192,14 @@ function Install-TestImages {
 }
 
 # ---------------------------------------------------------------------------
-# 2) yolo26n.onnx (exported, never committed: model weights are not redistributed)
+# 2) yolo26n.onnx / yolo26n-pose.onnx (exported, never committed: model weights are
+#    not redistributed)
 # ---------------------------------------------------------------------------
-function Install-Model {
-    if (Test-Path -LiteralPath $ModelPath) {
-        Write-Host "[skip] model: yolo26n.onnx already present"
-        return
-    }
-
-    Write-Host "[get ] model: exporting yolo26n.onnx from yolo26n.pt"
-
+function Initialize-PythonEnv {
+    <#
+        Prepare py/.venv with CPU torch + ultralytics. Only called when a model has to be
+        exported, and every step skips work that is already done.
+    #>
     $uv = Get-Command uv -ErrorAction SilentlyContinue
     if (-not $uv) {
         throw "uv not found on PATH; install uv (https://docs.astral.sh/uv/) so py/.venv can be prepared"
@@ -232,8 +234,8 @@ function Install-Model {
     }
     else {
         # Deliberately unpinned; if a future ultralytics release changes the YOLO26 ONNX
-        # export defaults (py/gen_reference.py assumes a (1, 300, 6) end2end output),
-        # pin the version here instead.
+        # export defaults (py/gen_reference.py assumes a (1, 300, 6) end2end output and
+        # the pose export a (4+nc+K*D) / (6+K*D) one), pin the version here instead.
         Write-Host "  installing ultralytics"
         Invoke-NativeCommand -What 'uv pip install ultralytics' -Command {
             & $uv.Source pip install --python $VenvPython ultralytics
@@ -243,23 +245,49 @@ function Install-Model {
     if (-not (Test-Path -LiteralPath $VenvYolo)) {
         throw "missing $VenvYolo; the ultralytics install did not provide the yolo entry point"
     }
+}
 
-    # ultralytics downloads yolo26n.pt and writes yolo26n.onnx next to it, i.e. into the
+function Export-Model {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $modelPath = Join-Path $RepoRoot "$Name.onnx"
+    if (Test-Path -LiteralPath $modelPath) {
+        Write-Host "[skip] model: $Name.onnx already present"
+        return
+    }
+
+    Write-Host "[get ] model: exporting $Name.onnx from $Name.pt"
+    # ultralytics downloads <name>.pt and writes <name>.onnx next to it, i.e. into the
     # current directory - run the export from the repository root.
     Push-Location $RepoRoot
     try {
-        Invoke-NativeCommand -What 'yolo export model=yolo26n.pt format=onnx' -Command {
-            & $VenvYolo export model=yolo26n.pt format=onnx
+        Invoke-NativeCommand -What "yolo export model=$Name.pt format=onnx" -Command {
+            & $VenvYolo export "model=$Name.pt" format=onnx
         }
     }
     finally {
         Pop-Location
     }
 
-    if (-not (Test-Path -LiteralPath $ModelPath)) {
-        throw "export finished but $ModelPath is missing"
+    if (-not (Test-Path -LiteralPath $modelPath)) {
+        throw "export finished but $modelPath is missing"
     }
-    Write-Host ("[ok  ] model -> {0} ({1:N1} MB)" -f $ModelPath, ((Get-Item -LiteralPath $ModelPath).Length / 1MB))
+    Write-Host ("[ok  ] model -> {0} ({1:N1} MB)" -f $modelPath, ((Get-Item -LiteralPath $modelPath).Length / 1MB))
+}
+
+function Install-Models {
+    $missing = @($ModelNames | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $RepoRoot "$_.onnx"))
+    })
+    if ($missing.Count -eq 0) {
+        Write-Host "[skip] models: $($ModelNames -join ', ') already exported"
+        return
+    }
+
+    Initialize-PythonEnv
+    foreach ($name in $ModelNames) {
+        Export-Model -Name $name
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -269,7 +297,7 @@ Write-Host "yolo_dml test assets"
 Write-Host "  repo root : $RepoRoot"
 
 Install-TestImages
-Install-Model
+Install-Models
 
 Write-Host ""
-Write-Host "test assets ready: assets\bus.jpg, assets\zidane.jpg, yolo26n.onnx"
+Write-Host "test assets ready: assets\bus.jpg, assets\zidane.jpg, yolo26n.onnx, yolo26n-pose.onnx"

@@ -33,6 +33,7 @@
     "image": "zidane.jpg",
     "width": 1280,
     "height": 720,
+    "layout": "end2end",
     "letterbox": {
       "new_w": 640,
       "new_h": 360,

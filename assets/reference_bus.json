@@ -51,6 +51,7 @@
     "image": "bus.jpg",
     "width": 810,
     "height": 1080,
+    "layout": "end2end",
     "letterbox": {
       "new_w": 480,
       "new_h": 640,

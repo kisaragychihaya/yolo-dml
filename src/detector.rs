@@ -10,7 +10,7 @@ use ort::execution_providers::DirectMLExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::tensor::TensorElementType;
-use ort::value::{Tensor, ValueType};
+use ort::value::{DynValue, Tensor, ValueType};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -226,6 +226,177 @@ fn parse_imgsz(raw: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// How the session's output tensors are laid out, decided once at load time from
+/// [`Session::outputs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputLayout {
+    /// A single output tensor: either the standard `1 x (4 + nc) x anchors` export or the
+    /// end-to-end `1 x N x 6` one, told apart by shape in [`postprocess::decode_output`]. The
+    /// `iou` argument of the detect entry points is honoured here.
+    Single,
+    /// Four tensors in the `torchvision` `PostprocessDetections` style, with the NMS already
+    /// applied by the graph: `num_detections` `1 x 1`, `detection_boxes` `1 x N x 4`,
+    /// `detection_scores` `1 x N` and `detection_classes` `1 x N`. The `iou` argument of the
+    /// detect entry points is ignored for these models — there is nothing left to suppress.
+    NmsApplied {
+        num: String,
+        boxes: String,
+        scores: String,
+        classes: String,
+    },
+}
+
+/// Names the four `torchvision` style outputs are recognised by: `(slot label, needles)`.
+///
+/// Matching is case-insensitive substring matching against the model's output names. The order
+/// is the assignment priority, so that e.g. `detection_classes` is not stolen by the `dets`
+/// needle meant for `num_detections`.
+const FOUR_OUTPUT_NEEDLES: [(&str, &[&str]); 4] = [
+    ("boxes", &["box"]),
+    ("scores", &["score"]),
+    ("classes", &["class", "label"]),
+    ("num_detections", &["num", "dets"]),
+];
+
+/// Case-insensitive "does `name` contain one of `needles`".
+fn name_matches(name: &str, needles: &[&str]) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    needles.iter().any(|needle| lowered.contains(needle))
+}
+
+/// Render declared outputs as `\`name\` (Float32 [1, 100, 4]), ...` for error messages.
+fn describe_outputs(outputs: &[(&str, &ValueType)]) -> String {
+    if outputs.is_empty() {
+        return "the model exposes no outputs".to_string();
+    }
+    outputs
+        .iter()
+        .map(|(name, output_type)| match output_type {
+            ValueType::Tensor { ty, dimensions, .. } => format!("`{name}` ({ty:?} {dimensions:?})"),
+            other => format!("`{name}` ({other:?})"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Index of the first not-yet-taken output whose name matches `needles`.
+fn take_slot(
+    outputs: &[(&str, &ValueType)],
+    taken: &mut [bool],
+    needles: &[&str],
+) -> Option<usize> {
+    let index = (0..outputs.len()).find(|&i| !taken[i] && name_matches(outputs[i].0, needles))?;
+    taken[index] = true;
+    Some(index)
+}
+
+/// Match the four `torchvision` style outputs to their roles.
+///
+/// Returns the output indices of `boxes`, `scores`, `classes` and `num_detections`, in that
+/// order. A single unrecognised name is filled in by exclusion (one name left for one open
+/// slot); anything less certain is an error rather than a guess.
+fn select_four(outputs: &[(&str, &ValueType)]) -> Result<[usize; 4]> {
+    let mut taken = vec![false; outputs.len()];
+    let mut selected: [Option<usize>; 4] = [None; 4];
+    for (slot, (_, needles)) in FOUR_OUTPUT_NEEDLES.iter().enumerate() {
+        selected[slot] = take_slot(outputs, &mut taken, needles);
+    }
+
+    let open: Vec<usize> = (0..4).filter(|&slot| selected[slot].is_none()).collect();
+    let remaining: Vec<usize> = (0..outputs.len()).filter(|&i| !taken[i]).collect();
+    if let ([slot], [index]) = (open.as_slice(), remaining.as_slice()) {
+        selected[*slot] = Some(*index);
+    }
+
+    for (slot, (label, _)) in FOUR_OUTPUT_NEEDLES.iter().enumerate() {
+        if selected[slot].is_none() {
+            return Err(Error::Ort(
+                format!(
+                    "model has four outputs ({}) but none of them looks like `{label}`",
+                    describe_outputs(outputs)
+                )
+                .into(),
+            ));
+        }
+    }
+    Ok(std::array::from_fn(|slot| {
+        selected[slot].expect("every slot was resolved above")
+    }))
+}
+
+/// Decide the output layout from the declared session outputs, in declaration order.
+///
+/// One output means the single-tensor decoders; four means the `torchvision`-style layout;
+/// any other count is rejected instead of silently reading `outputs[0]`, which would decode a
+/// model whose tensors are not what this library expects.
+fn resolve_layout(outputs: &[(&str, &ValueType)]) -> Result<OutputLayout> {
+    match outputs.len() {
+        1 => Ok(OutputLayout::Single),
+        4 => {
+            let [boxes, scores, classes, num] = select_four(outputs)?;
+            for (label, index) in [
+                ("boxes", boxes),
+                ("scores", scores),
+                ("classes", classes),
+                ("num_detections", num),
+            ] {
+                let (name, output_type) = outputs[index];
+                let ValueType::Tensor { ty, .. } = output_type else {
+                    return Err(Error::Ort(
+                        format!(
+                            "output `{name}` is used as `{label}` and must be a tensor: {}",
+                            describe_outputs(outputs)
+                        )
+                        .into(),
+                    ));
+                };
+                if matches!(label, "boxes" | "scores") && *ty != TensorElementType::Float32 {
+                    return Err(Error::Ort(
+                        format!(
+                            "output `{name}` is used as `{label}` and must be float32, got {ty:?}: {}",
+                            describe_outputs(outputs)
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            Ok(OutputLayout::NmsApplied {
+                num: outputs[num].0.to_string(),
+                boxes: outputs[boxes].0.to_string(),
+                scores: outputs[scores].0.to_string(),
+                classes: outputs[classes].0.to_string(),
+            })
+        }
+        count => Err(Error::Ort(
+            format!(
+                "unsupported output count {count}, expected 1 or 4 ({})",
+                describe_outputs(outputs)
+            )
+            .into(),
+        )),
+    }
+}
+
+/// `num_detections` scalar, whose dtype exporters disagree on (`int32`, `int64` or `float`).
+fn extract_num_detections(value: &DynValue) -> Result<i64> {
+    if let Ok((_, values)) = value.try_extract_raw_tensor::<i32>() {
+        return Ok(values.first().copied().unwrap_or(0) as i64);
+    }
+    if let Ok((_, values)) = value.try_extract_raw_tensor::<i64>() {
+        return Ok(values.first().copied().unwrap_or(0));
+    }
+    if let Ok((_, values)) = value.try_extract_raw_tensor::<f32>() {
+        return Ok(values.first().copied().unwrap_or(0.0).round() as i64);
+    }
+    Err(Error::Ort(
+        format!(
+            "`num_detections` must be an int32, int64 or float32 tensor, got {:?}",
+            value.dtype()
+        )
+        .into(),
+    ))
+}
+
 /// One loaded YOLO model.
 pub struct Detector {
     pub options: DetectorOptions,
@@ -236,6 +407,8 @@ pub struct Detector {
     input_height: u32,
     batch: u32,
     class_names: Vec<String>,
+    /// Output layout, resolved once from the session's declared outputs.
+    layout: OutputLayout,
     /// Provider the session really runs on (differs from `options.device` after a DML fallback).
     resolved_device: Device,
     device_detail: Option<String>,
@@ -250,6 +423,7 @@ impl std::fmt::Debug for Detector {
             .field("input_size", &(self.input_width, self.input_height))
             .field("batch", &self.batch)
             .field("classes", &self.class_names.len())
+            .field("outputs", &self.layout)
             .field("device", &self.device_label())
             .finish()
     }
@@ -375,6 +549,14 @@ impl Detector {
             imgsz.unwrap_or((INPUT_HEIGHT, INPUT_WIDTH))
         };
 
+        let layout = resolve_layout(
+            &session
+                .outputs
+                .iter()
+                .map(|output| (output.name.as_str(), &output.output_type))
+                .collect::<Vec<_>>(),
+        )?;
+
         Ok(Self {
             options: options.clone(),
             model_path: model_path.to_string(),
@@ -384,6 +566,7 @@ impl Detector {
             input_height,
             batch,
             class_names,
+            layout,
             resolved_device,
             device_detail,
         })
@@ -430,6 +613,11 @@ impl Detector {
         self.detect_preprocessed(pre, conf, iou)
     }
 
+    /// Run the session and decode whichever layout [`Self::layout`] resolved to.
+    ///
+    /// `iou` only reaches the standard single-output decoder: the end-to-end layout and the
+    /// four-output `torchvision` layout both arrive with the NMS already applied inside the
+    /// graph.
     fn detect_preprocessed(
         &mut self,
         mut pre: Preprocessed,
@@ -466,20 +654,88 @@ impl Detector {
         if outputs.len() == 0 {
             return Err(Error::Ort("session produced no outputs".into()));
         }
-        let output = outputs
-            .get("output0")
-            .unwrap_or_else(|| &outputs[0]);
-        let (dims, raw) = output
-            .try_extract_raw_tensor::<f32>()
-            .map_err(ort_err)?;
-        let detections = postprocess::decode_output(
-            raw,
-            dims,
-            &pre,
-            &self.class_names,
-            conf_threshold,
-            iou_threshold,
-        )?;
+        let detections = match &self.layout {
+            OutputLayout::Single => {
+                let output = outputs.get("output0").unwrap_or_else(|| &outputs[0]);
+                let (dims, raw) = output
+                    .try_extract_raw_tensor::<f32>()
+                    .map_err(ort_err)?;
+                postprocess::decode_output(
+                    raw,
+                    dims,
+                    &pre,
+                    &self.class_names,
+                    conf_threshold,
+                    iou_threshold,
+                )?
+            }
+            OutputLayout::NmsApplied {
+                num,
+                boxes,
+                scores,
+                classes,
+            } => {
+                let missing =
+                    |name: &str| Error::Ort(format!("session output `{name}` is missing").into());
+                let num_value = outputs.get(num).ok_or_else(|| missing(num))?;
+                let boxes_value = outputs.get(boxes).ok_or_else(|| missing(boxes))?;
+                let scores_value = outputs.get(scores).ok_or_else(|| missing(scores))?;
+                let classes_value = outputs.get(classes).ok_or_else(|| missing(classes))?;
+
+                let num_detections = extract_num_detections(num_value)?;
+                let (_, boxes_raw) = boxes_value
+                    .try_extract_raw_tensor::<f32>()
+                    .map_err(|e| {
+                        Error::Ort(format!("output `{boxes}` is not float32: {e}").into())
+                    })?;
+                let (_, scores_raw) = scores_value
+                    .try_extract_raw_tensor::<f32>()
+                    .map_err(|e| {
+                        Error::Ort(format!("output `{scores}` is not float32: {e}").into())
+                    })?;
+
+                // `detection_classes` carries whatever dtype the exporter picked for the labels.
+                if let Ok((_, raw)) = classes_value.try_extract_raw_tensor::<f32>() {
+                    postprocess::decode_nms_applied::<f32>(
+                        num_detections,
+                        boxes_raw,
+                        scores_raw,
+                        raw,
+                        &pre,
+                        &self.class_names,
+                        conf_threshold,
+                    )?
+                } else if let Ok((_, raw)) = classes_value.try_extract_raw_tensor::<i32>() {
+                    postprocess::decode_nms_applied::<i32>(
+                        num_detections,
+                        boxes_raw,
+                        scores_raw,
+                        raw,
+                        &pre,
+                        &self.class_names,
+                        conf_threshold,
+                    )?
+                } else if let Ok((_, raw)) = classes_value.try_extract_raw_tensor::<i64>() {
+                    postprocess::decode_nms_applied::<i64>(
+                        num_detections,
+                        boxes_raw,
+                        scores_raw,
+                        raw,
+                        &pre,
+                        &self.class_names,
+                        conf_threshold,
+                    )?
+                } else {
+                    return Err(Error::Ort(
+                        format!(
+                            "output `{classes}` must be a float32, int32 or int64 tensor, got {:?}",
+                            classes_value.dtype()
+                        )
+                        .into(),
+                    ));
+                }
+            }
+        };
 
         Ok(DetectionResult {
             detections,
@@ -675,5 +931,124 @@ mod tests {
         assert_eq!(parse_imgsz("[480, 640]"), Some((480, 640)));
         assert_eq!(parse_imgsz("640"), Some((640, 640)));
         assert_eq!(parse_imgsz("[]"), None);
+    }
+
+    fn tensor(ty: TensorElementType, dimensions: Vec<i64>) -> ValueType {
+        let dimension_symbols = vec![None; dimensions.len()];
+        ValueType::Tensor {
+            ty,
+            dimensions,
+            dimension_symbols,
+        }
+    }
+
+    fn layout_of(outputs: &[(&str, ValueType)]) -> Result<OutputLayout> {
+        resolve_layout(&outputs.iter().map(|(name, ty)| (*name, ty)).collect::<Vec<_>>())
+    }
+
+    fn four_output_layout() -> OutputLayout {
+        OutputLayout::NmsApplied {
+            num: "num_detections".to_string(),
+            boxes: "detection_boxes".to_string(),
+            scores: "detection_scores".to_string(),
+            classes: "detection_classes".to_string(),
+        }
+    }
+
+    #[test]
+    fn single_output_models_use_the_single_layout() {
+        let layout = layout_of(&[(
+            "output0",
+            tensor(TensorElementType::Float32, vec![1, 84, 8400]),
+        )])
+        .unwrap();
+        assert_eq!(layout, OutputLayout::Single);
+
+        // ... and so does the bundled detector
+        let detector = load_bus_detector();
+        assert_eq!(detector.layout, OutputLayout::Single);
+    }
+
+    #[test]
+    fn four_output_models_are_matched_by_name() {
+        let layout = layout_of(&[
+            ("num_detections", tensor(TensorElementType::Int32, vec![1, 1])),
+            ("detection_boxes", tensor(TensorElementType::Float32, vec![1, 100, 4])),
+            ("detection_scores", tensor(TensorElementType::Float32, vec![1, 100])),
+            ("detection_classes", tensor(TensorElementType::Int64, vec![1, 100])),
+        ])
+        .unwrap();
+        assert_eq!(layout, four_output_layout());
+
+        // matching is case-insensitive and tolerates other prefixes/suffixes
+        let layout = layout_of(&[
+            ("OutputNum", tensor(TensorElementType::Float32, vec![1, 1])),
+            ("NMS_Boxes", tensor(TensorElementType::Float32, vec![1, 16, 4])),
+            ("NMS_Scores", tensor(TensorElementType::Float32, vec![1, 16])),
+            ("NMS_Labels", tensor(TensorElementType::Float32, vec![1, 16])),
+        ])
+        .unwrap();
+        assert_eq!(
+            layout,
+            OutputLayout::NmsApplied {
+                num: "OutputNum".to_string(),
+                boxes: "NMS_Boxes".to_string(),
+                scores: "NMS_Scores".to_string(),
+                classes: "NMS_Labels".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn four_output_layout_falls_back_to_the_leftover_name() {
+        // `count` matches no needle; it is the only name left, so it must be `num_detections`
+        let layout = layout_of(&[
+            ("count", tensor(TensorElementType::Int64, vec![1, 1])),
+            ("boxes", tensor(TensorElementType::Float32, vec![1, 8, 4])),
+            ("scores", tensor(TensorElementType::Float32, vec![1, 8])),
+            ("classes", tensor(TensorElementType::Int32, vec![1, 8])),
+        ])
+        .unwrap();
+        assert_eq!(
+            layout,
+            OutputLayout::NmsApplied {
+                num: "count".to_string(),
+                boxes: "boxes".to_string(),
+                scores: "scores".to_string(),
+                classes: "classes".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unresolvable_outputs_are_rejected_with_the_actual_names() {
+        let two = layout_of(&[
+            ("output0", tensor(TensorElementType::Float32, vec![1, 84, 8400])),
+            ("output1", tensor(TensorElementType::Float32, vec![1, 32])),
+        ])
+        .unwrap_err();
+        assert!(two.to_string().contains("unsupported output count 2"), "{two}");
+        assert!(two.to_string().contains("output1"), "{two}");
+
+        // four outputs, but two of the names mean nothing to the heuristics
+        let ambiguous = layout_of(&[
+            ("boxes", tensor(TensorElementType::Float32, vec![1, 8, 4])),
+            ("scores", tensor(TensorElementType::Float32, vec![1, 8])),
+            ("mystery_a", tensor(TensorElementType::Float32, vec![1, 8])),
+            ("mystery_b", tensor(TensorElementType::Float32, vec![1, 8])),
+        ])
+        .unwrap_err();
+        assert!(ambiguous.to_string().contains("classes"), "{ambiguous}");
+        assert!(ambiguous.to_string().contains("mystery_a"), "{ambiguous}");
+
+        // boxes/scores must be float32
+        let wrong_dtype = layout_of(&[
+            ("num_detections", tensor(TensorElementType::Int32, vec![1, 1])),
+            ("detection_boxes", tensor(TensorElementType::Int64, vec![1, 8, 4])),
+            ("detection_scores", tensor(TensorElementType::Float32, vec![1, 8])),
+            ("detection_classes", tensor(TensorElementType::Int32, vec![1, 8])),
+        ])
+        .unwrap_err();
+        assert!(wrong_dtype.to_string().contains("must be float32"), "{wrong_dtype}");
     }
 }

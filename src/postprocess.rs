@@ -1,8 +1,11 @@
 //! Postprocessing: decode raw YOLO output tensors -> boxes -> NMS.
 //!
-//! Two output layouts are supported: the end-to-end export (`1 x N x 6`, NMS already
-//! applied by the model) and the standard export (`1 x (4 + nc) x anchors`, needs
-//! transposing, thresholding and class-aware NMS here).
+//! Two output layouts are supported by the single-tensor decoders: the end-to-end export
+//! (`1 x N x 6`, NMS already applied by the model, [`decode_end2end`]) and the standard export
+//! (`1 x (4 + nc) x anchors`, needs transposing, thresholding and class-aware NMS here,
+//! [`decode_and_nms`]). A third layout — the four-tensor `torchvision` style export
+//! (`num_detections`, `detection_boxes`, `detection_scores`, `detection_classes`, NMS baked
+//! into the graph) — is decoded by [`decode_nms_applied`].
 
 use crate::detector::Detection;
 use crate::error::{Error, Result};
@@ -105,14 +108,17 @@ pub fn xywh2xyxy(cx: f32, cy: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
 }
 
 /// One candidate box while decoding, in network-input coordinates.
-#[derive(Debug, Clone, Copy)]
-struct Candidate {
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-    confidence: f32,
-    class_id: i32,
+///
+/// Public, with public fields, only so that the `bench_nms` example can build candidate sets and
+/// compare the two NMS implementations; [`decode_and_nms`] is the single in-crate producer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Candidate {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub confidence: f32,
+    pub class_id: i32,
 }
 
 impl Candidate {
@@ -124,7 +130,105 @@ impl Candidate {
 }
 
 /// Greedy NMS. Candidates are returned in descending confidence order, capped at `max_det`.
-fn nms(candidates: &[Candidate], iou_threshold: f32, max_det: usize) -> Vec<Candidate> {
+///
+/// Structure-of-arrays scan: the candidates are ordered once (stable, by descending confidence)
+/// and then copied into five flat `f32` vectors — corners plus precomputed area — with the
+/// class offset already added. The pair loop therefore touches contiguous memory and never
+/// re-derives the suppression box or a box area, and a winner only compares against the
+/// candidates *after* it in that order.
+///
+/// A fully branch-free variant (compute the whole IoU row into a reused buffer, then
+/// `suppressed[j] |= row[j] > threshold`) was measured to be *slower* on realistic candidate
+/// sets: it recomputes IoU for every candidate an earlier winner already suppressed, which is
+/// most of them. What is kept from it is the branch-free flag write (`iou > threshold` as `u8`)
+/// and the skip of suppressed candidates, which `examples/bench_nms.rs` measures.
+///
+/// Semantics are bit-for-bit identical to [`nms_reference`]: the arithmetic of [`iou`] is
+/// reproduced in the same order, with the same `min`/`max` arguments, the same
+/// `area_a + area_b - inter` union and the same `union <= 0` guard, on the same shifted
+/// coordinates. The array-of-structs version stays the executable definition of those semantics.
+pub fn nms(candidates: &[Candidate], iou_threshold: f32, max_det: usize) -> Vec<Candidate> {
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| candidates[b].confidence.total_cmp(&candidates[a].confidence));
+    nms_ordered(candidates, &order, iou_threshold, max_det)
+}
+
+/// [`nms`] body, with the confidence ordering already computed.
+fn nms_ordered(
+    candidates: &[Candidate],
+    order: &[usize],
+    iou_threshold: f32,
+    max_det: usize,
+) -> Vec<Candidate> {
+    let count = order.len();
+    let mut x1 = Vec::with_capacity(count);
+    let mut y1 = Vec::with_capacity(count);
+    let mut x2 = Vec::with_capacity(count);
+    let mut y2 = Vec::with_capacity(count);
+    let mut area = Vec::with_capacity(count);
+    for &index in order {
+        let candidate = candidates[index];
+        let shift = candidate.class_id as f32 * CLASS_OFFSET;
+        let (sx1, sy1, sx2, sy2) = (
+            candidate.x1 + shift,
+            candidate.y1 + shift,
+            candidate.x2 + shift,
+            candidate.y2 + shift,
+        );
+        x1.push(sx1);
+        y1.push(sy1);
+        x2.push(sx2);
+        y2.push(sy2);
+        area.push((sx2 - sx1).max(0.0) * (sy2 - sy1).max(0.0));
+    }
+
+    // Slice them down to `count` explicitly: that length assertion lets LLVM drop the bounds
+    // checks inside the scan below.
+    let (x1, y1, x2, y2, area) = (
+        &x1[..count],
+        &y1[..count],
+        &x2[..count],
+        &y2[..count],
+        &area[..count],
+    );
+
+    let mut suppressed = vec![0u8; count];
+    let mut kept: Vec<Candidate> = Vec::new();
+    for rank in 0..count {
+        if suppressed[rank] != 0 {
+            continue;
+        }
+        kept.push(candidates[order[rank]]);
+        if kept.len() >= max_det {
+            break;
+        }
+        let (ax1, ay1, ax2, ay2) = (x1[rank], y1[rank], x2[rank], y2[rank]);
+        let winner_area = area[rank];
+        for j in rank + 1..count {
+            if suppressed[j] != 0 {
+                continue;
+            }
+            let inter_w = (ax2.min(x2[j]) - ax1.max(x1[j])).max(0.0);
+            let inter_h = (ay2.min(y2[j]) - ay1.max(y1[j])).max(0.0);
+            let inter = inter_w * inter_h;
+            let union = winner_area + area[j] - inter;
+            let iou = if union <= 0.0 { 0.0 } else { inter / union };
+            suppressed[j] = (iou > iou_threshold) as u8;
+        }
+    }
+    kept
+}
+
+/// Reference implementation of [`nms`]: the straightforward array-of-structs greedy loop.
+///
+/// Kept as the executable definition of the NMS semantics (and as the benchmark baseline) —
+/// [`nms`] must return exactly the same sequence, in the same order.
+#[doc(hidden)]
+pub fn nms_reference(
+    candidates: &[Candidate],
+    iou_threshold: f32,
+    max_det: usize,
+) -> Vec<Candidate> {
     let mut order: Vec<usize> = (0..candidates.len()).collect();
     order.sort_by(|&a, &b| candidates[b].confidence.total_cmp(&candidates[a].confidence));
 
@@ -187,6 +291,99 @@ pub fn decode_end2end(
             class_name: class_name(class_names, None, class_id),
         });
     }
+    Ok(detections)
+}
+
+/// Element type of a `detection_classes` tensor.
+///
+/// `torchvision` exports the class ids either as the integer tensor the `NonMaxSuppression` op
+/// produces or as a float tensor some exporters derive from it; both denote the same index.
+pub trait ClassIndex: Copy {
+    /// Class id stored in the tensor.
+    fn class_id(self) -> i32;
+}
+
+impl ClassIndex for f32 {
+    fn class_id(self) -> i32 {
+        self.round() as i32
+    }
+}
+
+impl ClassIndex for i32 {
+    fn class_id(self) -> i32 {
+        self
+    }
+}
+
+impl ClassIndex for i64 {
+    fn class_id(self) -> i32 {
+        self as i32
+    }
+}
+
+/// Decode the four-tensor `torchvision` style export, where the graph already ran NMS.
+///
+/// `boxes` is `1 x N x 4` (`x1 y1 x2 y2` in network-input coordinates, i.e. the letterboxed
+/// `640 x 640` canvas), `scores` and `classes` are `1 x N`, and `num_detections` is the number
+/// of valid rows, so only the first `min(num_detections, N)` rows are looked at. Rows below
+/// `conf_threshold` are dropped: the graph's NMS kept them for its own `max_det`, not for ours.
+///
+/// The ONNX `NonMaxSuppression` op walks batches and classes before scores, so the rows it
+/// emits are *not* in global score order; the surviving detections are re-sorted by descending
+/// confidence to match what every other layout returns.
+pub fn decode_nms_applied<C: ClassIndex>(
+    num_detections: i64,
+    boxes: &[f32],
+    scores: &[f32],
+    classes: &[C],
+    pre: &Preprocessed,
+    class_names: &[String],
+    conf_threshold: f32,
+) -> Result<Vec<Detection>> {
+    if boxes.len() % 4 != 0 {
+        return Err(Error::invalid(format!(
+            "detection_boxes holds {} values, not a multiple of 4",
+            boxes.len()
+        )));
+    }
+    let rows = boxes.len() / 4;
+    if scores.len() < rows || classes.len() < rows {
+        return Err(Error::invalid(format!(
+            "NMS-applied outputs disagree: {rows} boxes, {} scores, {} classes",
+            scores.len(),
+            classes.len()
+        )));
+    }
+    let count = if num_detections <= 0 {
+        0
+    } else {
+        (num_detections as u64).min(rows as u64) as usize
+    };
+
+    let mut detections = Vec::new();
+    for index in 0..count {
+        let confidence = scores[index];
+        if !(confidence > conf_threshold) {
+            continue;
+        }
+        let (x1, y1, x2, y2) = pre.to_source_box(
+            boxes[4 * index],
+            boxes[4 * index + 1],
+            boxes[4 * index + 2],
+            boxes[4 * index + 3],
+        );
+        let class_id = classes[index].class_id();
+        detections.push(Detection {
+            x1,
+            y1,
+            x2,
+            y2,
+            confidence,
+            class_id,
+            class_name: class_name(class_names, None, class_id),
+        });
+    }
+    detections.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
     Ok(detections)
 }
 
@@ -473,5 +670,220 @@ mod tests {
         assert_eq!(dets.len(), 1);
 
         assert!(decode_output(&[], &[1, 2], &pre, &[], 0.25, 0.7).is_err());
+    }
+
+    /// Deterministic `xorshift64*` PRNG, so the randomized test stays dependency free.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+        }
+
+        /// Uniform in `[0, 1)`.
+        fn next_f32(&mut self) -> f32 {
+            (self.next_u32() >> 8) as f32 / (1u32 << 24) as f32
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            self.next_u32() as usize % bound
+        }
+    }
+
+    /// Adversarial candidate set: a few dense clusters (heavy same-class overlap), boxes whose
+    /// geometry is copied from another candidate (cross-class and same-class duplicates),
+    /// quantised confidences (many exact ties for the stable sort), degenerate zero/negative area
+    /// boxes and negative coordinates.
+    fn synthetic_candidates(seed: u64, count: usize) -> Vec<Candidate> {
+        let mut rng = Rng::new(seed);
+        let clusters: Vec<(f32, f32)> = (0..4)
+            .map(|_| (rng.next_f32() * 800.0 - 100.0, rng.next_f32() * 800.0 - 100.0))
+            .collect();
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(count);
+        while candidates.len() < count {
+            let (x1, y1, mut x2, mut y2) = if rng.below(4) == 0 && !candidates.is_empty() {
+                let same = candidates[rng.below(candidates.len())];
+                (same.x1, same.y1, same.x2, same.y2)
+            } else {
+                let (cx, cy) = clusters[rng.below(clusters.len())];
+                let x1 = cx + rng.next_f32() * 40.0 - 20.0;
+                let y1 = cy + rng.next_f32() * 40.0 - 20.0;
+                (x1, y1, x1 + rng.next_f32() * 120.0, y1 + rng.next_f32() * 120.0)
+            };
+            match rng.below(16) {
+                0 => x2 = x1,       // zero area: vertical line
+                1 => y2 = y1,       // zero area: horizontal line
+                2 => x2 = x1 - 5.0, // negative area
+                _ => {}
+            }
+            let confidence = rng.below(8) as f32 / 8.0 + 0.125;
+            let class_id = rng.below(3) as i32;
+            candidates.push(Candidate {
+                x1,
+                y1,
+                x2,
+                y2,
+                confidence,
+                class_id,
+            });
+        }
+        candidates
+    }
+
+    #[test]
+    fn nms_matches_reference_on_synthetic_data() {
+        assert_eq!(nms(&[], 0.7, MAX_DET), Vec::new());
+
+        let mut suppressed_somewhere = false;
+        for seed in 0..6u64 {
+            for count in [50usize, 500] {
+                let candidates = synthetic_candidates(seed, count);
+                for iou_threshold in [0.05f32, 0.45, 0.7, 1.0] {
+                    for max_det in [0usize, 17, MAX_DET] {
+                        let fast = nms(&candidates, iou_threshold, max_det);
+                        let reference = nms_reference(&candidates, iou_threshold, max_det);
+                        assert_eq!(
+                            fast, reference,
+                            "seed {seed}, count {count}, iou {iou_threshold}, max_det {max_det}"
+                        );
+                        assert!(
+                            fast.windows(2).all(|pair| pair[0].confidence >= pair[1].confidence),
+                            "kept candidates must stay in descending confidence order"
+                        );
+                        suppressed_somewhere |= fast.len() < candidates.len();
+                    }
+                }
+            }
+        }
+        // Guard against a vacuous test: some of those candidate sets must actually be pruned.
+        assert!(suppressed_somewhere);
+    }
+
+    /// Letterboxed `640 x 640` canvas mapped back onto a `320 x 240` source (gain 0.5 / 0.375).
+    fn letterboxed_pre() -> Preprocessed {
+        Preprocessed {
+            tensor: Vec::new(),
+            input_width: 640,
+            input_height: 640,
+            src_width: 320,
+            src_height: 240,
+            gain_x: 0.5,
+            gain_y: 0.375,
+            pad_x: 0.0,
+            pad_y: 0.0,
+        }
+    }
+
+    /// Four-output payload: rows are grouped by class (not by score), one row is below the
+    /// confidence threshold, and the last two rows are padding the graph never counted.
+    fn nms_applied_inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let boxes = vec![
+            100.0f32, 200.0, 300.0, 400.0, // row 0, class 3, conf 0.60
+            10.0, 20.0, 30.0, 40.0, // row 1, class 1, conf 0.90
+            400.0, 400.0, 480.0, 480.0, // row 2, class 2, conf 0.30
+            50.0, 60.0, 70.0, 80.0, // row 3, class 0, conf 0.10 (below threshold)
+            0.0, 0.0, 1.0, 1.0, // padding
+            0.0, 0.0, 1.0, 1.0, // padding
+        ];
+        let scores = vec![0.60f32, 0.90, 0.30, 0.10, 0.0, 0.0];
+        let classes = vec![3.0f32, 1.0, 2.0, 0.0, 0.0, 0.0];
+        (boxes, scores, classes)
+    }
+
+    #[test]
+    fn decode_nms_applied_filters_sorts_and_maps_back() {
+        let pre = letterboxed_pre();
+        let (boxes, scores, classes) = nms_applied_inputs();
+
+        let detections =
+            decode_nms_applied(4, &boxes, &scores, &classes, &pre, &[], 0.25).unwrap();
+        assert_eq!(detections.len(), 3, "{detections:?}");
+        // re-sorted by confidence although the rows came class-grouped
+        let confidences: Vec<f32> = detections.iter().map(|d| d.confidence).collect();
+        assert_eq!(confidences, vec![0.90, 0.60, 0.30]);
+        assert_eq!(
+            detections.iter().map(|d| d.class_id).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+        // no `names` metadata: ids < 80 fall back to the built-in COCO table
+        assert_eq!(detections[0].class_name, "bicycle");
+        assert_eq!(detections[1].class_name, "motorcycle");
+        assert_eq!(detections[2].class_name, "car");
+        // network canvas -> source pixels
+        let first = &detections[0];
+        assert!((first.x1 - 20.0).abs() < 1e-4, "{first:?}");
+        assert!((first.y1 - 20.0 / 0.375).abs() < 1e-4, "{first:?}");
+        assert!((first.x2 - 60.0).abs() < 1e-4, "{first:?}");
+        assert!((first.y2 - 40.0 / 0.375).abs() < 1e-4, "{first:?}");
+
+        // `num_detections` truncates the rows: only row 0 and 1 are valid, then 0.90 sorts first
+        let truncated =
+            decode_nms_applied(2, &boxes, &scores, &classes, &pre, &[], 0.25).unwrap();
+        assert_eq!(truncated.len(), 2);
+        assert_eq!(truncated[0].confidence, 0.90);
+        assert_eq!(truncated[1].confidence, 0.60);
+
+        // nothing counted, and a count above the row count
+        assert!(decode_nms_applied(0, &boxes, &scores, &classes, &pre, &[], 0.25)
+            .unwrap()
+            .is_empty());
+        assert!(decode_nms_applied(-3, &boxes, &scores, &classes, &pre, &[], 0.25)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            decode_nms_applied(9_999, &boxes, &scores, &classes, &pre, &[], 0.25)
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // a confidence exactly on the threshold is rejected (`score > conf_threshold`)
+        let on_threshold =
+            decode_nms_applied(4, &boxes, &scores, &classes, &pre, &[], 0.60).unwrap();
+        assert_eq!(on_threshold.len(), 1);
+    }
+
+    #[test]
+    fn decode_nms_applied_accepts_integer_classes() {
+        let pre = letterboxed_pre();
+        let (boxes, scores, classes_f32) = nms_applied_inputs();
+        let classes_i32: Vec<i32> = classes_f32.iter().map(|&c| c as i32).collect();
+        let classes_i64: Vec<i64> = classes_f32.iter().map(|&c| c as i64).collect();
+
+        let from_f32 =
+            decode_nms_applied(4, &boxes, &scores, &classes_f32, &pre, &[], 0.25).unwrap();
+        let from_i32 =
+            decode_nms_applied(4, &boxes, &scores, &classes_i32, &pre, &[], 0.25).unwrap();
+        let from_i64 =
+            decode_nms_applied(4, &boxes, &scores, &classes_i64, &pre, &[], 0.25).unwrap();
+        assert_eq!(from_f32, from_i32);
+        assert_eq!(from_f32, from_i64);
+    }
+
+    #[test]
+    fn decode_nms_applied_rejects_malformed_tensors() {
+        let pre = letterboxed_pre();
+        // boxes not a multiple of 4
+        assert!(decode_nms_applied::<f32>(1, &[0.0, 1.0], &[], &[], &pre, &[], 0.25).is_err());
+        // fewer scores / classes than boxes
+        let boxes = [0.0f32, 0.0, 10.0, 10.0];
+        assert!(decode_nms_applied::<f32>(1, &boxes, &[], &[], &pre, &[], 0.25).is_err());
+        assert!(decode_nms_applied::<f32>(1, &boxes, &[0.9], &[], &pre, &[], 0.25).is_err());
+        // ... and the well-formed case works
+        assert_eq!(
+            decode_nms_applied(1, &boxes, &[0.9], &[1i32], &pre, &[], 0.25)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

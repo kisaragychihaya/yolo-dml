@@ -8,9 +8,11 @@ Rust 编写的 YOLO 目标检测 DLL：OpenCV 做图像预处理（letterbox）�
 
 ## 特性
 
-- 支持两类 ultralytics 导出模型：
-  - **end2end**：输出 `(1, N, 6)`（模型已内置 NMS，如 `yolo26n.onnx`）
-  - **标准格式**：输出 `(1, 4+nc, anchors)`（DLL 内做置信度过滤 + 类感知 NMS，兼容 YOLOv8/v11 常规导出）
+- 支持三类导出布局：
+  - **end2end**：输出 `(1, N, 6)`（模型已内置 NMS，如 `yolo26n.onnx`；ultralytics `yolo export nms=True` 也是此格式）
+  - **标准格式**：输出 `(1, 4+nc, anchors)`（DLL 内部完成置信度过滤 + 类感知 NMS，兼容 YOLOv8/v11/v26 常规导出）
+  - **torchvision 四输出**：图内带 `NonMaxSuppression` 算子的导出（`num_detections` / `detection_boxes` / `detection_scores` / `detection_classes` 四个输出），DLL 内部完成解码与坐标反算
+- NMS 为 SoA + 行扫描实现（无新依赖，IoU 是 broadcast+elementwise 而非 GEMM，矩阵库无收益）：候选 N=5000 时约 2.2ms（朴素 AoS 3.5ms），语义与 ultralytics 贪心 NMS 逐位一致（144 组随机配置对照验证，见 `cargo run --release --example bench_nms`）
 - LetterBox 缩放/114 灰边/中心对齐、BGR→RGB、CHW、÷255，与 ultralytics `LetterBox` 完全一致
 - 坐标反算采用 `scale_boxes` 的 X/Y 独立增益（gain_x/gain_y），任意宽高比无亚像素误差
 - 类名自动读取模型 metadata 的 `names` 字段，缺省时回退内置 COCO80
@@ -110,6 +112,8 @@ py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_zidane.json
 
 - 仅检测（detect）任务；静态 batch 必须为 1（动态 batch 按 1 处理）
 - 输入张量限 float32 NCHW 3 通道（YOLO 标准输入）
+- **图内已带 NMS 的模型**（end2end `(1,N,6)` 与 torchvision 四输出）：`iou` 参数完全无效（NMS 已按导出时阈值在图内完成），`conf` 只能往严格调
+- 图内含 `NonMaxSuppression` 算子的模型在 DirectML 下会话创建成功，但该算子及其尾巴会**静默回退 CPU 执行**（ORT 分区行为），`meta.device` 仍显示 `dml`；对纯 CPU 机器无影响
 - 标准格式输出的 NMS 未实现 ultralytics 的 `max_nms=30000` 上限裁剪（8400 anchors 远低于此，无实际影响）
 - 上下文类名解析按 `,` 分割，类名本身含逗号会被切错（ultralytics 官方模型无此情况）
 

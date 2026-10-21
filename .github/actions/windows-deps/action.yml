@@ -1,0 +1,48 @@
+name: Windows native deps
+description: >-
+  Restore/cache the thirdparty native runtimes, lay them out with
+  scripts/setup-deps.ps1, prepare the Python venv, fetch the test images and
+  export yolo26n.onnx. The caller must check out the repository first.
+
+inputs:
+  deps-version:
+    description: Cache-busting version for the thirdparty layer; bump it whenever the layout or the download sources change.
+    required: false
+    default: "1"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache thirdparty native runtimes
+      uses: actions/cache@v4
+      with:
+        path: |
+          thirdparty/onnxruntime-dml
+          thirdparty/opencv
+          thirdparty/clang-stub/clang.exe
+        key: thirdparty-${{ runner.os }}-${{ inputs.deps-version }}-${{ hashFiles('scripts/setup-deps.ps1', 'thirdparty/clang-stub/clang_stub.rs') }}
+
+    - name: Lay out native dependencies
+      shell: pwsh
+      run: ./scripts/setup-deps.ps1
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Prepare Python environment
+      shell: pwsh
+      run: |
+        if (-not (Test-Path py/.venv/Scripts/python.exe)) {
+          uv venv --seed py/.venv
+        }
+        uv pip install --python py/.venv/Scripts/python.exe -r py/requirements.txt
+
+    - name: Fetch test images and export the ONNX model
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: ./scripts/fetch-test-assets.ps1
+
+    - name: Regenerate golden references
+      shell: pwsh
+      run: py/.venv/Scripts/python.exe py/gen_reference.py

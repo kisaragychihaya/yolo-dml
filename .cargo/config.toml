@@ -1,0 +1,22 @@
+# Build-time environment for the opencv crate (bindgen + link) and clang-sys.
+# `relative = true` resolves against this project root (the dir containing .cargo/).
+
+[env]
+OPENCV_INCLUDE_PATHS = { value = "thirdparty/opencv/build/include", relative = true }
+OPENCV_LINK_PATHS = { value = "thirdparty/opencv/build/x64/vc16/lib", relative = true }
+OPENCV_LINK_LIBS = "opencv_world4100"
+
+# libclang.dll from the Python `clang` wheel; clang-sys (opencv feature
+# `clang-runtime`) dlopens it from here, so no import library is needed.
+LIBCLANG_PATH = { value = "py/.venv/Lib/site-packages/clang/native", relative = true }
+
+# This machine has no LLVM `clang` driver. `thirdparty/clang-stub/clang.exe`
+# answers clang-sys' only question to it (`clang -E -x c++ - -v` -> default
+# include search paths); the real header parsing is done by libclang above.
+CLANG_PATH = { value = "thirdparty/clang-stub/clang.exe", relative = true }
+
+# The installed MSVC STL (14.44 / 202503) hard-errors under clang < 19
+# ("STL1000: Unexpected compiler version"); libclang available here is 18.1.1.
+# `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` is the documented MSVC STL escape
+# hatch for exactly this situation.
+OPENCV_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"

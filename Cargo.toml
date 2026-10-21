@@ -1,0 +1,27 @@
+[package]
+name = "yolo_dml"
+version = "0.1.0"
+edition = "2021"
+description = "YOLO inference over ONNX Runtime DirectML with OpenCV preprocessing, exposed as a C ABI cdylib"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# load-dynamic: dlopen onnxruntime.dll at runtime (no GitHub download, no import lib).
+# directml: enables the DML execution provider.
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "directml"] }
+# Pinned explicitly: ort's `^2.0.0-rc.9` requirement would otherwise resolve to
+# ort-sys 2.0.0-rc.10, which is generated against ONNX Runtime 1.22 headers while
+# thirdparty/onnxruntime-dml ships 1.20.1.
+ort-sys = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "directml"] }
+# clang-runtime: clang-sys dlopens libclang.dll (LIBCLANG_PATH) instead of linking
+#   an import library, which this machine does not have.
+# Only the modules YOLO preprocessing needs are enabled: the full default set makes
+# binding generation (and compilation) several times longer and pulls in headers we
+# never call.
+opencv = { version = "0.99", default-features = false, features = ["clang-runtime", "imgcodecs", "imgproc"] }
+serde_json = "1"
+once_cell = "1"

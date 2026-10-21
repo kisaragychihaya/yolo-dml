@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build release bundle (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Needed before the composite action: setup-deps.ps1 compiles the clang.exe shim
+      # with rustc when the thirdparty cache is cold.
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Native deps, venv, test assets
+        uses: ./.github/actions/windows-deps
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Package yolo-dml-windows-x64.zip
+        shell: pwsh
+        run: |
+          $stage = 'dist/yolo-dml-windows-x64'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          foreach ($file in @(
+              'target/release/yolo_dml.dll',
+              'target/release/onnxruntime.dll',
+              'target/release/DirectML.dll',
+              'target/release/opencv_world4100.dll'
+            )) {
+            if (-not (Test-Path $file)) { throw "missing build artifact: $file" }
+            Copy-Item $file $stage
+          }
+          Copy-Item README.md, LICENSE $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath dist/yolo-dml-windows-x64.zip -Force
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/yolo-dml-windows-x64.zip
+          generate_release_notes: true

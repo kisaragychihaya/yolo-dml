@@ -1,0 +1,43 @@
+{
+  "count": 3,
+  "detections": [
+    {
+      "x1": 745.18,
+      "y1": 40.26,
+      "x2": 1149.86,
+      "y2": 710.65,
+      "confidence": 0.918452,
+      "class_id": 0,
+      "class_name": "person"
+    },
+    {
+      "x1": 119.89,
+      "y1": 201.82,
+      "x2": 987.41,
+      "y2": 713.47,
+      "confidence": 0.903023,
+      "class_id": 0,
+      "class_name": "person"
+    },
+    {
+      "x1": 433.58,
+      "y1": 430.67,
+      "x2": 525.5,
+      "y2": 714.79,
+      "confidence": 0.529722,
+      "class_id": 27,
+      "class_name": "tie"
+    }
+  ],
+  "meta": {
+    "image": "zidane.jpg",
+    "width": 1280,
+    "height": 720,
+    "letterbox": {
+      "new_w": 640,
+      "new_h": 360,
+      "pad_x": 0,
+      "pad_y": 140
+    }
+  }
+}

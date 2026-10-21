@@ -1,0 +1,14 @@
+# Python side of this repository: golden-reference generation (py/gen_reference.py),
+# the demo / QC scripts (examples/*.py), and the libclang that the `opencv` crate's
+# binding generator dlopens at build time (.cargo/config.toml -> LIBCLANG_PATH).
+#
+#   uv pip install --python py/.venv/Scripts/python.exe -r py/requirements.txt
+#
+numpy>=1.26
+onnx>=1.16
+opencv-python>=4.10
+onnxruntime>=1.20
+
+# libclang 18 is the version the crate bindings were validated against; the MSVC STL
+# version check is disabled by OPENCV_CLANG_ARGS in .cargo/config.toml.
+libclang>=18.1.1,<20

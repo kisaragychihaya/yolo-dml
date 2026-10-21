@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build and test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Installed before the composite action because setup-deps.ps1 compiles the
+      # clang.exe shim with rustc when it is not cached.
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Native deps, venv, test assets
+        uses: ./.github/actions/windows-deps
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: cargo test
+        run: cargo test
+
+      - name: Demo (ctypes end-to-end)
+        run: py/.venv/Scripts/python.exe examples/demo.py --release
+
+      - name: Compare bus.jpg against the Python reference
+        run: py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_bus.json assets/reference_bus.json
+
+      - name: Compare zidane.jpg against the Python reference
+        run: py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_zidane.json assets/reference_zidane.json

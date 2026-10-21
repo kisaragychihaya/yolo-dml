@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# Native runtime dependencies: downloaded by scripts/setup-deps.ps1 (binaries
+# are never committed; their licences allow redistribution but the repo keeps
+# only the fetch recipe so the checkout stays small).
+# ---------------------------------------------------------------------------
+thirdparty/opencv/
+thirdparty/onnxruntime-dml/*.dll
+thirdparty/clang-stub/clang.exe
+thirdparty/clang-stub/clang.pdb
+thirdparty/.downloads/
+
+# ---------------------------------------------------------------------------
+# Model weights and sample images: fetched by scripts/fetch-test-assets.ps1
+# (AGPL-3.0 / ultralytics asset licences - not redistributed here).
+# ---------------------------------------------------------------------------
+yolo26n.onnx
+*.onnx
+*.pt
+
+# ---------------------------------------------------------------------------
+# Generated local artefacts: DLL output, overlays, raw tensors.
+# (assets/reference_*.json is the committed golden reference.)
+# ---------------------------------------------------------------------------
+assets/*.jpg
+assets/dll_*.json
+assets/raw_*.npy
+dist/
+
+# ---------------------------------------------------------------------------
+# Toolchains / build output
+# ---------------------------------------------------------------------------
+target/
+py/.venv/
+__pycache__/
+*.py[cod]
+
+# Upstream ultralytics clone used as a read-only reference; never committed.
+ultralytics/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+.idea/
+*.swp
+*~

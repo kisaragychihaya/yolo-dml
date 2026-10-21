@@ -110,13 +110,30 @@ function Get-RemoteFile {
 function Test-PythonModule {
     param(
         [Parameter(Mandatory)][string]$Python,
-        [Parameter(Mandatory)][string]$Module
+        [Parameter(Mandatory)][string]$Module,
+        [Parameter(Mandatory)][string]$VenvDir
     )
 
-    $exitCode = Invoke-NativeCommand -What "python -c import $Module" -AllowFailure -Command {
-        & $Python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('$Module') else 1)"
+    # `-I` (isolated mode) keeps the caller's cwd off sys.path: the working tree ships
+    # a top-level directory named `ultralytics` (the read-only reference clone) that
+    # Python would otherwise resolve as a namespace package and report as "installed".
+    # The reported origin is additionally required to live inside the venv, so a hit
+    # can never come from the system interpreter or a stale exit code.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $origin = & $Python -I -c "import importlib.util; s = importlib.util.find_spec('$Module'); print(s.origin if s and s.origin else '')" 2>$null
     }
-    return ($exitCode -eq 0)
+    finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($LASTEXITCODE -ne 0 -or -not $origin) {
+        return $false
+    }
+    $venv = ($VenvDir -replace '/', '\').TrimEnd('\')
+    $inside = ($origin -replace '/', '\').StartsWith($venv + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    Write-Host "  [check] $Module -> $origin (inside venv: $inside)"
+    return $inside
 }
 
 # ---------------------------------------------------------------------------
@@ -200,7 +217,7 @@ function Install-Model {
 
     # CPU wheels first: the default PyPI `torch` drags in ~2.5 GB of CUDA libraries
     # that nothing here uses.
-    if (Test-PythonModule -Python $VenvPython -Module 'torch') {
+    if (Test-PythonModule -Python $VenvPython -Module 'torch' -VenvDir $VenvDir) {
         Write-Host "[skip] torch already installed"
     }
     else {
@@ -210,7 +227,7 @@ function Install-Model {
         }
     }
 
-    if (Test-PythonModule -Python $VenvPython -Module 'ultralytics') {
+    if (Test-PythonModule -Python $VenvPython -Module 'ultralytics' -VenvDir $VenvDir) {
         Write-Host "[skip] ultralytics already installed"
     }
     else {

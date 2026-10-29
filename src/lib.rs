@@ -60,6 +60,29 @@
 //! graph produced. [`yolo_decode_tensors`] returns the same document with `meta.inference_ms`
 //! `0.0`, because the inference happened in the caller.
 //!
+//! OBB models (`task` `"obb"`) add a `xywhr` array (`[cx, cy, w, h, angle]`, angle in radians)
+//! and the four `corners` of the rotated box per detection; `x1`..`y2` then hold the minimal
+//! axis-aligned box enclosing the rotated one. OBB geometry is **not** clipped to the image
+//! (mirroring the `xywh` branch of ultralytics' `scale_boxes`):
+//!
+//! ```json
+//! {
+//!   "count": 1,
+//!   "detections": [
+//!     {"x1": 96.0, "y1": 218.0, "x2": 176.0, "y2": 278.0,
+//!      "confidence": 0.91, "class_id": 0, "class_name": "plane",
+//!      "xywhr": [136.0, 248.0, 80.0, 40.0, 0.785],
+//!      "corners": [[120.2, 234.2], [176.8, 262.8], [151.8, 261.8], [95.2, 233.2]]}
+//!   ],
+//!   "meta": {"width": 1024, "height": 768, "device": "dml", "inference_ms": 12.34, "task": "obb"}
+//! }
+//! ```
+//!
+//! Both single-output OBB layouts are supported: the standard export `(1, 4+nc+1, anchors)`
+//! (`cx cy w h`, class scores, angle) and the end-to-end export `(1, N, 7)`
+//! (`cx cy w h conf cls angle`). OBB models are recognised by the `task` metadata; NMS runs on
+//! the rotated boxes with the probabilistic IoU (ultralytics `batch_probiou`).
+//!
 //! The returned string is heap-allocated by the library and must be released with
 //! [`yolo_free_string`]. A `conf`/`iou` argument `<= 0` selects the defaults `0.25` / `0.7`.
 //!
@@ -460,7 +483,7 @@ unsafe fn tensor_views<'a>(
 /// Use this when the ONNX session runs in the caller (any runtime): the DLL only does the
 /// decoding, confidence filtering and NMS. `tensors` must hold the model's outputs in the layout
 /// described by the loaded model — one tensor for a single-output export (routed by shape,
-/// pose included) or the four `torchvision` tensors, matched by name first and by shape
+/// pose and obb included) or the four `torchvision` tensors, matched by name first and by shape
 /// otherwise. `src_width`/`src_height` are the **source image** dimensions: the letterbox
 /// geometry is rebuilt from them and from the model's input size, so the caller's preprocessing
 /// must match this library's letterbox (aspect-preserving resize into `input_width x

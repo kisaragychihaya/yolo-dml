@@ -118,6 +118,50 @@ pub struct Detection {
     pub class_name: String,
     /// Pose keypoints, in source-image pixels; `None` for detect models.
     pub keypoints: Option<Vec<Keypoint>>,
+    /// Rotated box, in source-image pixels; `Some` for OBB models. `x1..y2` then hold the
+    /// minimal axis-aligned box enclosing it.
+    pub obb: Option<Obb>,
+}
+
+/// One oriented bounding box in pixel coordinates of the source image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Obb {
+    pub cx: f32,
+    pub cy: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Rotation in radians, as the graph emitted it (ultralytics convention, roughly
+    /// `[-pi/4, 3pi/4)`; not re-normalized).
+    pub angle: f32,
+}
+
+impl Obb {
+    /// Corner points in the order of ultralytics' `xywhr2xyxyxyxy`
+    /// (`pt1 = ctr + vec1 + vec2`, then alternating signs).
+    pub fn corners(&self) -> [(f32, f32); 4] {
+        let (sin, cos) = self.angle.sin_cos();
+        let (v1x, v1y) = (self.w / 2.0 * cos, self.w / 2.0 * sin);
+        let (v2x, v2y) = (-self.h / 2.0 * sin, self.h / 2.0 * cos);
+        [
+            (self.cx + v1x + v2x, self.cy + v1y + v2y),
+            (self.cx + v1x - v2x, self.cy + v1y - v2y),
+            (self.cx - v1x - v2x, self.cy - v1y - v2y),
+            (self.cx - v1x + v2x, self.cy - v1y + v2y),
+        ]
+    }
+
+    /// Minimal axis-aligned box enclosing the rotated box, unclipped (ultralytics' `OBB.xyxy`
+    /// is derived from the corners the same way).
+    pub fn enclosing_box(&self) -> (f32, f32, f32, f32) {
+        let mut box_ = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for (x, y) in self.corners() {
+            box_.0 = box_.0.min(x);
+            box_.1 = box_.1.min(y);
+            box_.2 = box_.2.max(x);
+            box_.3 = box_.3.max(y);
+        }
+        box_
+    }
 }
 
 /// One pose keypoint in pixel coordinates of the source image.
@@ -130,13 +174,15 @@ pub struct Keypoint {
     pub visibility: Option<f32>,
 }
 
-/// What a model predicts: plain boxes, or boxes plus keypoints.
+/// What a model predicts: plain boxes, boxes plus keypoints, or rotated boxes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Task {
     /// Object detection (`meta.task` `"detect"`).
     Detect,
     /// Pose estimation (`meta.task` `"pose"`).
     Pose,
+    /// Oriented bounding box detection (`meta.task` `"obb"`).
+    Obb,
 }
 
 impl Task {
@@ -145,6 +191,7 @@ impl Task {
         match self {
             Task::Detect => "detect",
             Task::Pose => "pose",
+            Task::Obb => "obb",
         }
     }
 }
@@ -168,11 +215,13 @@ impl DetectionResult {
     /// Serialise to the JSON document returned by `yolo_detect_*`.
     ///
     /// Schema: `{"count":N,"detections":[{"x1":f,"y1":f,"x2":f,"y2":f,"confidence":f,
-    /// "class_id":i,"class_name":s[,"keypoints":[[x,y,v],...]]}],
+    /// "class_id":i,"class_name":s[,"keypoints":[[x,y,v],...]][,"xywhr":[...],"corners":[...]]}],
     /// "meta":{"width":i,"height":i,"device":s,"inference_ms":f,"task":s}}`
     ///
     /// The `keypoints` array is only present for pose models; a `(K, 2)` model emits `[x, y]`
-    /// pairs instead of `[x, y, v]` triples.
+    /// pairs instead of `[x, y, v]` triples. OBB models add `xywhr` (`[cx, cy, w, h, angle]`,
+    /// angle in radians) and `corners` (the four corner points, `[[x, y], ...]`); `x1..y2` is
+    /// then the axis-aligned box enclosing the rotated one.
     pub fn to_json(&self) -> String {
         let detections: Vec<Value> = self
             .detections
@@ -189,6 +238,10 @@ impl DetectionResult {
                 });
                 if let (Some(keypoints), Some(object)) = (&d.keypoints, value.as_object_mut()) {
                     object.insert("keypoints".to_string(), keypoints_json(keypoints));
+                }
+                if let (Some(obb), Some(object)) = (&d.obb, value.as_object_mut()) {
+                    object.insert("xywhr".to_string(), obb_xywhr_json(obb));
+                    object.insert("corners".to_string(), obb_corners_json(obb));
                 }
                 value
             })
@@ -219,6 +272,27 @@ fn keypoints_json(keypoints: &[Keypoint]) -> Value {
                 }
                 None => serde_json::json!([round3(point.x), round3(point.y)]),
             })
+            .collect(),
+    )
+}
+
+/// `[cx, cy, w, h, angle]` in source-image pixels; the angle in radians.
+fn obb_xywhr_json(obb: &Obb) -> Value {
+    serde_json::json!([
+        round3(obb.cx),
+        round3(obb.cy),
+        round3(obb.w),
+        round3(obb.h),
+        round3(obb.angle),
+    ])
+}
+
+/// `[[x, y], ...]` corner points of the rotated box, in [`Obb::corners`] order.
+fn obb_corners_json(obb: &Obb) -> Value {
+    Value::Array(
+        obb.corners()
+            .iter()
+            .map(|(x, y)| serde_json::json!([round3(*x), round3(*y)]))
             .collect(),
     )
 }
@@ -288,9 +362,10 @@ fn parse_imgsz(raw: &str) -> Option<(u32, u32)> {
 /// [`Session::outputs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputLayout {
-    /// A single output tensor: either the standard `1 x (4 + nc) x anchors` export or the
-    /// end-to-end `1 x N x 6` one, told apart by shape in [`postprocess::decode_output`]. The
-    /// `iou` argument of the detect entry points is honoured here.
+    /// A single output tensor: the standard `1 x (4 + nc [+ K*D | + 1]) x anchors` export or
+    /// the end-to-end `1 x N x (6 | 6 + K*D | 7)` one, told apart by shape in
+    /// [`postprocess::decode_output`] / [`postprocess::decode_obb_output`]. The `iou` argument
+    /// of the detect entry points is honoured by the standard decoders only.
     Single,
     /// Four tensors in the `torchvision` `PostprocessDetections` style, with the NMS already
     /// applied by the graph: `num_detections` `1 x 1`, `detection_boxes` `1 x N x 4`,
@@ -828,7 +903,7 @@ impl Detector {
             ));
         }
 
-        let (class_names, imgsz, kpt_shape, declares_pose) = {
+        let (class_names, imgsz, kpt_shape, task_metadata) = {
             let metadata = session.metadata().ok();
             let names = metadata.as_ref().and_then(|m| m.custom("names").ok().flatten());
             let imgsz = metadata.as_ref().and_then(|m| m.custom("imgsz").ok().flatten());
@@ -840,14 +915,17 @@ impl Detector {
                 names.as_deref().and_then(parse_names).unwrap_or_default(),
                 imgsz.as_deref().and_then(parse_imgsz),
                 kpt_shape.as_deref().and_then(KptShape::parse),
-                task.as_deref()
-                    .is_some_and(|task| task.trim().eq_ignore_ascii_case("pose")),
+                task,
             )
         };
-        // `kpt_shape` is what actually drives the decoding, so it decides the task; the `task`
-        // metadata alone (without a shape) still marks the model as pose, its keypoint layout is
+        // The `task` metadata decides between detect and OBB (their output shapes are not
+        // distinguishable otherwise); for pose, `kpt_shape` is what actually drives the
+        // decoding, so it decides the task even without the metadata, whose keypoint layout is
         // then taken from the output shape at decode time.
-        let task = if kpt_shape.is_some() || declares_pose {
+        let declared = task_metadata.as_deref().map(str::trim);
+        let task = if declared.is_some_and(|task| task.eq_ignore_ascii_case("obb")) {
+            Task::Obb
+        } else if kpt_shape.is_some() || declared.is_some_and(|task| task.eq_ignore_ascii_case("pose")) {
             Task::Pose
         } else {
             Task::Detect
@@ -889,13 +967,15 @@ impl Detector {
             .map(|output| (output.name.as_str(), &output.output_type))
             .collect();
         let layout = resolve_layout(&declared_outputs)?;
-        if task == Task::Pose && matches!(layout, OutputLayout::NmsApplied { .. }) {
-            // The four-tensor layout has no slot for keypoints, so decoding it as pose would
-            // silently drop them; refuse it instead of returning boxes without keypoints.
+        if task != Task::Detect && matches!(layout, OutputLayout::NmsApplied { .. }) {
+            // The four-tensor layout has no slot for keypoints or the angle, so decoding it as
+            // pose/obb would silently drop them; refuse it instead of returning boxes without
+            // the task payload.
             return Err(Error::Ort(
                 format!(
-                    "pose model `{model_path}` has a torchvision four-output layout, which this \
+                    "{} model `{model_path}` has a torchvision four-output layout, which this \
                      library only decodes as detect ({})",
+                    task.as_str(),
                     describe_outputs(&declared_outputs)
                 )
                 .into(),
@@ -1046,15 +1126,25 @@ impl Detector {
                 let (dims, raw) = output
                     .try_extract_raw_tensor::<f32>()
                     .map_err(ort_err)?;
-                postprocess::decode_output_with_kpt(
-                    raw,
-                    dims,
-                    &pre,
-                    &self.class_names,
-                    conf_threshold,
-                    iou_threshold,
-                    self.kpt_shape,
-                )?
+                match self.task {
+                    Task::Obb => postprocess::decode_obb_output(
+                        raw,
+                        dims,
+                        &pre,
+                        &self.class_names,
+                        conf_threshold,
+                        iou_threshold,
+                    )?,
+                    _ => postprocess::decode_output_with_kpt(
+                        raw,
+                        dims,
+                        &pre,
+                        &self.class_names,
+                        conf_threshold,
+                        iou_threshold,
+                        self.kpt_shape,
+                    )?,
+                }
             }
             OutputLayout::NmsApplied {
                 num,
@@ -1144,7 +1234,8 @@ impl Detector {
     /// [`preprocess::letterbox_params`], i.e. exactly the mapping [`Self::detect_file`] uses.
     ///
     /// `tensors` follows the model's output layout: one tensor for `OutputLayout::Single` (decoded
-    /// by shape, pose included) or the four `torchvision` tensors for `OutputLayout::NmsApplied`.
+    /// by shape, pose and obb included) or the four `torchvision` tensors for
+    /// `OutputLayout::NmsApplied`.
     /// The four are matched by the names the model declares, then by role names, then by shape
     /// (see [`select_four_views`]). `conf`/`iou` `<= 0` select the same defaults as the FFI.
     ///
@@ -1189,15 +1280,25 @@ impl Detector {
                 }
                 let tensor = &tensors[0];
                 let raw = tensor.floats()?;
-                postprocess::decode_output_with_kpt(
-                    &raw,
-                    tensor.dims,
-                    &pre,
-                    &self.class_names,
-                    conf_threshold,
-                    iou_threshold,
-                    self.kpt_shape,
-                )?
+                match self.task {
+                    Task::Obb => postprocess::decode_obb_output(
+                        &raw,
+                        tensor.dims,
+                        &pre,
+                        &self.class_names,
+                        conf_threshold,
+                        iou_threshold,
+                    )?,
+                    _ => postprocess::decode_output_with_kpt(
+                        &raw,
+                        tensor.dims,
+                        &pre,
+                        &self.class_names,
+                        conf_threshold,
+                        iou_threshold,
+                        self.kpt_shape,
+                    )?,
+                }
             }
             OutputLayout::NmsApplied {
                 num,
@@ -1424,6 +1525,7 @@ mod tests {
                 class_id: 7,
                 class_name: "truck".to_string(),
                 keypoints: None,
+                obb: None,
             }],
             width: 64,
             height: 32,
@@ -1466,6 +1568,7 @@ mod tests {
                 class_id: 0,
                 class_name: "person".to_string(),
                 keypoints: Some(keypoints),
+                obb: None,
             }],
             width: 64,
             height: 32,
@@ -1483,6 +1586,56 @@ mod tests {
         // emitted as a plain [x, y] pair rather than a null
         assert_eq!(points[0], serde_json::json!([10.0, 20.0, 0.875]));
         assert_eq!(points[1], serde_json::json!([30.123, 40.988]));
+    }
+
+    #[test]
+    fn obb_json_carries_xywhr_corners_and_task() {
+        let obb = Obb {
+            cx: 50.0,
+            cy: 40.0,
+            w: 20.0,
+            h: 10.0,
+            angle: std::f32::consts::FRAC_PI_2,
+        };
+        let (x1, y1, x2, y2) = obb.enclosing_box();
+        let result = DetectionResult {
+            detections: vec![Detection {
+                x1,
+                y1,
+                x2,
+                y2,
+                confidence: 0.9,
+                class_id: 3,
+                class_name: "plane".to_string(),
+                keypoints: None,
+                obb: Some(obb),
+            }],
+            width: 100,
+            height: 100,
+            device: Device::Cpu,
+            device_detail: None,
+            inference_ms: 1.0,
+            task: Task::Obb,
+        };
+        let parsed: Value = serde_json::from_str(&result.to_json()).unwrap();
+        assert_eq!(parsed["meta"]["task"], "obb");
+        let detection = &parsed["detections"][0];
+        assert!(detection.get("keypoints").is_none());
+
+        let xywhr = detection["xywhr"].as_array().expect("OBB detections carry xywhr");
+        assert_eq!(xywhr.len(), 5);
+        let expected_xywh = serde_json::json!([50.0, 40.0, 20.0, 10.0]);
+        assert_eq!(xywhr[..4], expected_xywh.as_array().unwrap()[..]);
+        assert_eq!(xywhr[4], serde_json::json!(1.571)); // pi/2, rounded to 3 decimals
+
+        let corners = detection["corners"].as_array().expect("OBB detections carry corners");
+        assert_eq!(corners.len(), 4);
+        // a 90-degree rotation swaps the extents: the enclosing box is h x w around the center
+        assert_eq!(corners[0], serde_json::json!([45.0, 50.0]));
+        assert!((detection["x1"].as_f64().unwrap() - 45.0).abs() < 1e-3, "{detection}");
+        assert!((detection["y1"].as_f64().unwrap() - 30.0).abs() < 1e-3, "{detection}");
+        assert!((detection["x2"].as_f64().unwrap() - 55.0).abs() < 1e-3, "{detection}");
+        assert!((detection["y2"].as_f64().unwrap() - 50.0).abs() < 1e-3, "{detection}");
     }
 
     #[test]
@@ -1616,8 +1769,10 @@ mod tests {
     fn bus_bgr() -> (Vec<u8>, i32, i32) {
         use opencv::prelude::{MatTraitConst, MatTraitConstManual};
         let path = workspace().join("assets/bus.jpg");
-        let mat = opencv::imgcodecs::imread(
-            path.to_str().unwrap(),
+        // imdecode, not imread: OpenCV cannot open paths outside the system codepage
+        let bytes = std::fs::read(&path).expect("bus.jpg should be readable");
+        let mat = opencv::imgcodecs::imdecode(
+            &opencv::core::Vector::<u8>::from_iter(bytes),
             opencv::imgcodecs::IMREAD_COLOR,
         )
         .expect("bus.jpg should load");
@@ -1906,6 +2061,122 @@ mod tests {
             "{} unmatched extra detections: {unmatched:?}",
             unmatched.len()
         );
+    }
+
+    /// Golden gate for OBB models, the rotated counterpart of
+    /// [`pose_bus_matches_python_reference`]. Both OBB layouts are covered: the yolo26
+    /// end-to-end export and the yolo11 standard export. Skipped when the model or the
+    /// reference JSON was not fetched/generated (see `scripts/fetch-test-assets.ps1` and
+    /// `py/gen_reference.py --task obb`).
+    fn obb_golden_gate(model_name: &str, reference_name: &str) {
+        let model = workspace().join(model_name);
+        if !model.is_file() {
+            eprintln!("skipping the obb golden gate: {model_name} is not exported");
+            return;
+        }
+        let reference_path = workspace().join("assets").join(reference_name);
+        if !reference_path.is_file() {
+            eprintln!(
+                "skipping the obb golden gate: {} is not generated yet",
+                reference_path.display()
+            );
+            return;
+        }
+
+        point_ort_at_bundled_dll();
+        let mut detector = Detector::new(model.to_str().unwrap(), DetectorOptions::default())
+            .expect("the obb detector should load");
+        assert_eq!(detector.task(), Task::Obb);
+        let result = detector
+            .detect_file(workspace().join("assets/boats.jpg").to_str().unwrap(), 0.25, 0.7)
+            .expect("inference should succeed");
+        assert!(
+            result.detections.iter().all(|d| d.obb.is_some()),
+            "{:?}",
+            result.detections
+        );
+
+        // Match on class + probIoU >= 0.9 of the xywhr boxes (probiou of identical boxes is
+        // ~0.9995), then |dconf| < 0.01, |dangle| <= 0.02 and corners within 2 px. The count
+        // may differ by one for the same threshold-flip reason as the detect gate.
+        let reference: Value = serde_json::from_str(
+            &std::fs::read_to_string(&reference_path).expect("the reference should be readable"),
+        )
+        .expect("the reference JSON should parse");
+        let expected = reference["detections"]
+            .as_array()
+            .expect("the reference should carry a detections array");
+        assert!(!expected.is_empty(), "the reference carries no detections");
+
+        let mut unmatched: Vec<&Detection> = result.detections.iter().collect();
+        for reference in expected {
+            let class_id = reference["class_id"].as_i64().unwrap() as i32;
+            let rbox: Vec<f32> = reference["xywhr"]
+                .as_array()
+                .expect("obb references carry xywhr")
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+            let position = unmatched.iter().position(|detection| {
+                detection.class_id == class_id
+                    && detection.obb.is_some_and(|obb| {
+                        postprocess::probiou(
+                            (obb.cx, obb.cy, obb.w, obb.h, obb.angle),
+                            (rbox[0], rbox[1], rbox[2], rbox[3], rbox[4]),
+                        ) >= 0.9
+                    })
+            });
+            let detection = position.map(|index| unmatched.remove(index)).unwrap_or_else(|| {
+                panic!("reference detection {reference} has no Rust match in {unmatched:?}")
+            });
+            let confidence = reference["confidence"].as_f64().unwrap() as f32;
+            assert!(
+                (detection.confidence - confidence).abs() < 0.01,
+                "confidence {} vs reference {confidence}",
+                detection.confidence
+            );
+
+            let obb = detection.obb.unwrap();
+            assert!(
+                (obb.angle - rbox[4]).abs() <= 0.02,
+                "angle {} vs reference {}",
+                obb.angle,
+                rbox[4]
+            );
+            let corners = reference["corners"]
+                .as_array()
+                .expect("obb references carry corners");
+            for (index, (x, y)) in obb.corners().iter().enumerate() {
+                let (rx, ry) = (
+                    corners[index][0].as_f64().unwrap() as f32,
+                    corners[index][1].as_f64().unwrap() as f32,
+                );
+                assert!(
+                    (x - rx).abs() <= 2.0 && (y - ry).abs() <= 2.0,
+                    "corner {index}: ({x}, {y}) vs reference ({rx}, {ry})"
+                );
+            }
+        }
+        assert!(
+            unmatched.len() <= 1,
+            "{} unmatched extra detections: {unmatched:?}",
+            unmatched.len()
+        );
+    }
+
+    #[test]
+    fn obb_boats_matches_python_reference() {
+        obb_golden_gate("yolo26n-obb.onnx", "reference_obb_boats.json");
+    }
+
+    #[test]
+    fn obb_standard_boats_matches_python_reference() {
+        obb_golden_gate("yolo11n-obb.onnx", "reference_obb_yolo11n_boats.json");
+    }
+
+    #[test]
+    fn obb_end2end_boats_matches_python_reference() {
+        obb_golden_gate("yolo26n-obb-e2e.onnx", "reference_obb_yolo26n_boats.json");
     }
 
     fn bytes_of_f32(values: &[f32]) -> Vec<u8> {

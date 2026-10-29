@@ -6,13 +6,16 @@
     The repository does not redistribute Ultralytics' sample images or the exported
     models (see README), so this script fetches them:
 
-      assets/bus.jpg, assets/zidane.jpg   ultralytics/assets release v0.0.0
-                                          (gh CLI first, plain curl fallback)
+      assets/bus.jpg, assets/zidane.jpg,  ultralytics/assets release v0.0.0
+      assets/boats.jpg                    (gh CLI first, plain curl fallback);
+                                          boats.jpg is the aerial image the OBB goldens use
       yolo26n.onnx                        exported locally from yolo26n.pt with the
                                           `ultralytics` package inside py/.venv
       yolo26n-pose.onnx                   same, from yolo26n-pose.pt (pose model; the
                                           detect tests do not need it, the pose tests
                                           and `examples/demo.py --pose` do)
+      yolo26n-obb.onnx                    OBB model, end-to-end (1, N, 7) layout
+      yolo11n-obb.onnx                    OBB model, standard (1, 4+nc+1, anchors) layout
 
     Idempotent: existing files are skipped, and torch / ultralytics are only installed
     when the venv does not already provide them.
@@ -38,9 +41,10 @@ $AssetsDir = Join-Path $RepoRoot 'assets'
 $VenvDir = Join-Path $RepoRoot 'py\.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $VenvYolo = Join-Path $VenvDir 'Scripts\yolo.exe'
-$ImageNames = @('bus.jpg', 'zidane.jpg')
+$ImageNames = @('bus.jpg', 'zidane.jpg', 'boats.jpg')
 # Model names, exported as "<name>.onnx" from "<name>.pt" into the repository root.
-$ModelNames = @('yolo26n', 'yolo26n-pose')
+# yolo26n-obb covers the end-to-end OBB layout, yolo11n-obb the standard one.
+$ModelNames = @('yolo26n', 'yolo26n-pose', 'yolo26n-obb', 'yolo11n-obb')
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -281,13 +285,50 @@ function Install-Models {
     })
     if ($missing.Count -eq 0) {
         Write-Host "[skip] models: $($ModelNames -join ', ') already exported"
+    }
+    else {
+        Initialize-PythonEnv
+        foreach ($name in $ModelNames) {
+            Export-Model -Name $name
+        }
+    }
+    Install-ObbEnd2EndModel
+}
+
+function Install-ObbEnd2EndModel {
+    <#
+        yolo26n-obb-e2e.onnx: the same yolo26n-obb.pt exported with nms=True, i.e. the
+        graph-baked rotated-NMS (1, N, 7) layout. The exporter writes to yolo26n-obb.onnx
+        regardless, so the standard export has to be moved aside / restored around it.
+    #>
+    $e2ePath = Join-Path $RepoRoot 'yolo26n-obb-e2e.onnx'
+    $standardPath = Join-Path $RepoRoot 'yolo26n-obb.onnx'
+    if (Test-Path -LiteralPath $e2ePath) {
+        Write-Host "[skip] model: yolo26n-obb-e2e.onnx already present"
         return
     }
 
     Initialize-PythonEnv
-    foreach ($name in $ModelNames) {
-        Export-Model -Name $name
+    Write-Host "[get ] model: exporting yolo26n-obb-e2e.onnx from yolo26n-obb.pt (nms=True)"
+    Push-Location $RepoRoot
+    try {
+        Invoke-NativeCommand -What "yolo export model=yolo26n-obb.pt format=onnx nms=True" -Command {
+            & $VenvYolo export "model=yolo26n-obb.pt" format=onnx "nms=True"
+        }
+        Move-Item -LiteralPath $standardPath -Destination $e2ePath -Force
+        Write-Host "  re-exporting the standard yolo26n-obb.onnx (the e2e export clobbered it)"
+        Invoke-NativeCommand -What "yolo export model=yolo26n-obb.pt format=onnx" -Command {
+            & $VenvYolo export "model=yolo26n-obb.pt" format=onnx
+        }
     }
+    finally {
+        Pop-Location
+    }
+
+    if (-not (Test-Path -LiteralPath $e2ePath) -or -not (Test-Path -LiteralPath $standardPath)) {
+        throw "e2e OBB export failed: yolo26n-obb-e2e.onnx / yolo26n-obb.onnx incomplete"
+    }
+    Write-Host "[ok  ] model -> $e2ePath"
 }
 
 # ---------------------------------------------------------------------------
@@ -300,4 +341,4 @@ Install-TestImages
 Install-Models
 
 Write-Host ""
-Write-Host "test assets ready: assets\bus.jpg, assets\zidane.jpg, yolo26n.onnx, yolo26n-pose.onnx"
+Write-Host "test assets ready: assets\bus.jpg, assets\zidane.jpg, assets\boats.jpg, $($ModelNames -join ', ').onnx"

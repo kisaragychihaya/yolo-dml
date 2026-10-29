@@ -12,10 +12,17 @@ export layouts supported are:
                                 values, already decoded to letterbox pixels by the
                                 exported graph (see Pose/Pose26.kpts_decode export
                                 branch); rows become xyxy+conf+cls+kpts here
+  standard-obb    (1, 4+nc+1, A)  cx cy w h + per-class scores + angle (radians);
+                                decoded here with probIoU rotated NMS (mirrors the
+                                rotated=True branch of ultralytics' non_max_suppression)
+  end2end-obb     (1, N, 7)       cx cy w h conf cls angle rows, NMS baked into the graph
 
 Run:  py/.venv/Scripts/python.exe py/gen_reference.py               # detect goldens
       py/.venv/Scripts/python.exe py/gen_reference.py --task pose   # pose goldens
       py/.venv/Scripts/python.exe py/gen_reference.py --task pose --verify-e2e
+      py/.venv/Scripts/python.exe py/gen_reference.py --task obb    # obb goldens (yolo26n-obb, end2end)
+      py/.venv/Scripts/python.exe py/gen_reference.py --task obb --model yolo11n-obb.onnx
+                                                                    # obb goldens, standard layout
 """
 
 from __future__ import annotations
@@ -29,17 +36,26 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# absolute(), not resolve(): cv2.imread/open need the path the user invoked, not the
+# resolved one — resolve() chases directory junctions, which can turn an ASCII working
+# path into a non-ASCII real one that the native side cannot open.
+SCRIPT_DIR = Path(__file__).absolute().parent
 ROOT = SCRIPT_DIR.parent
 ASSETS = ROOT / "assets"
 
 MODELS = {
     "detect": ROOT / "yolo26n.onnx",
     "pose": ROOT / "yolo26n-pose.onnx",
+    # yolo26 OBB exports are end-to-end (1, N, 7); pass --model yolo11n-obb.onnx to
+    # generate goldens for the standard (1, 4+nc+1, anchors) layout instead.
+    "obb": ROOT / "yolo26n-obb.onnx",
 }
 E2E_POSE_MODEL = ROOT / "yolo26n-pose-e2e.onnx"
 
 IMAGES = ("bus.jpg", "zidane.jpg")
+# OBB models are DOTA-trained; the COCO street scenes yield few to no boxes, so the
+# obb goldens use the aerial sample image instead.
+OBB_IMAGES = ("boats.jpg",)
 
 IMGSZ = 640
 CONF_THRES = 0.25
@@ -70,22 +86,27 @@ COCO80 = [
 ]
 
 
-def letterbox(img: np.ndarray, new_shape: int = IMGSZ, color: int = 114):
-    """Ultralytics-style letterbox: resize preserving aspect ratio, pad to square."""
+def letterbox(img: np.ndarray, new_shape: int | tuple[int, int] = IMGSZ, color: int = 114):
+    """Ultralytics-style letterbox: resize preserving aspect ratio, pad to the canvas.
+
+    `new_shape` is a square side or a (canvas_h, canvas_w) pair taken from the model's
+    input shape (OBB checkpoints are exported at 1024, detect/pose at 640).
+    """
     h, w = img.shape[:2]
-    r = min(new_shape / h, new_shape / w)
+    canvas_h, canvas_w = (new_shape, new_shape) if isinstance(new_shape, int) else new_shape
+    r = min(canvas_h / h, canvas_w / w)
     new_w, new_h = round(w * r), round(h * r)
     if (w, h) != (new_w, new_h):
         img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-    dw = (new_shape - new_w) / 2.0
-    dh = (new_shape - new_h) / 2.0
+    dw = (canvas_w - new_w) / 2.0
+    dh = (canvas_h - new_h) / 2.0
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    assert left + new_w + right == new_shape, (left, new_w, right)
-    assert top + new_h + bottom == new_shape, (top, new_h, bottom)
+    assert left + new_w + right == canvas_w, (left, new_w, right)
+    assert top + new_h + bottom == canvas_h, (top, new_h, bottom)
 
-    out = np.full((new_shape, new_shape, 3), color, dtype=img.dtype)
+    out = np.full((canvas_h, canvas_w, 3), color, dtype=img.dtype)
     out[top : top + new_h, left : left + new_w] = img
     return out, new_w, new_h, left, top
 
@@ -141,7 +162,9 @@ def detect_layout(shape: tuple[int, ...], task: str = "detect",
 
     With a pose model the keypoint channels are folded into the detect row, so both
     layouts are matched on their exact width rather than on a > test: standard is
-    (1, 4+nc+K*D, anchors), end2end is (1, max_det, 6+K*D).
+    (1, 4+nc+K*D, anchors), end2end is (1, max_det, 6+K*D). OBB adds one angle
+    channel: standard is (1, 4+nc+1, anchors), end2end is (1, max_det, 7) with
+    cx cy w h conf cls angle rows (the rotated heads decode to xywh, not xyxy).
     """
     if len(shape) != 3:
         raise ValueError(f"unexpected output shape {shape}")
@@ -153,11 +176,81 @@ def detect_layout(shape: tuple[int, ...], task: str = "detect",
         if shape[2] == 6 + k * d:
             return "end2end-pose"
         raise ValueError(f"unexpected pose output shape {shape} for kpt_shape={kpt_shape}, nc={nc}")
+    if task == "obb":
+        if shape[2] == 7:
+            return "end2end-obb"
+        if shape[1] > 5:
+            return "standard-obb"
+        raise ValueError(f"unexpected obb output shape {shape}")
     if shape[2] == 6:
         return "end2end"
     if shape[1] > 5:
         return "standard"
     raise ValueError(f"unexpected output shape {shape}")
+
+
+def probiou(a: np.ndarray, b: np.ndarray, eps: float = 1e-7) -> float:
+    """Probabilistic IoU of two (cx, cy, w, h, angle) boxes (ultralytics `batch_probiou`)."""
+    def cov(r: np.ndarray) -> tuple[float, float, float]:
+        var_w, var_h = r[2] ** 2 / 12.0, r[3] ** 2 / 12.0
+        c, s = np.cos(r[4]), np.sin(r[4])
+        return (var_w * c * c + var_h * s * s,
+                var_w * s * s + var_h * c * c,
+                (var_w - var_h) * s * c)
+
+    a1, b1, c1 = cov(a)
+    a2, b2, c2 = cov(b)
+    x1, y1, x2, y2 = a[0], a[1], b[0], b[1]
+    denom = (a1 + a2) * (b1 + b2) - (c1 + c2) ** 2 + eps
+    t1 = ((a1 + a2) * (y1 - y2) ** 2 + (b1 + b2) * (x1 - x2) ** 2) / denom * 0.25
+    t2 = ((c1 + c2) * (x2 - x1) * (y1 - y2)) / denom * 0.5
+    t3 = np.log(((a1 + a2) * (b1 + b2) - (c1 + c2) ** 2)
+                / (4 * np.sqrt(max(a1 * b1 - c1 ** 2, 0.0) * max(a2 * b2 - c2 ** 2, 0.0)) + eps)
+                + eps) * 0.5
+    bd = min(max(t1 + t2 + t3, eps), 100.0)
+    return float(1.0 - np.sqrt(1.0 - np.exp(-bd) + eps))
+
+
+def decode_standard_obb(pred: np.ndarray, nc: int,
+                        iou_thres: float = IOU_THRES) -> np.ndarray:
+    """Decode a standard (4+nc+1, anchors) OBB prediction into cx cy w h conf cls angle rows.
+
+    Mirrors the rotated=True branch of ultralytics' non_max_suppression: best class per
+    anchor, then class-aware rotated NMS with the probabilistic IoU and TorchNMS.fast_nms
+    semantics — a candidate is suppressed by ANY higher-scored candidate (kept or not),
+    class centres are offset by class_id * 7680.
+    """
+    scores = pred[4 : 4 + nc]
+    best = scores.max(axis=0)
+    cls = scores.argmax(axis=0)
+    cand = best > CONF_THRES
+
+    cx, cy = pred[0, cand], pred[1, cand]
+    w, h = pred[2, cand], pred[3, cand]
+    angle = pred[4 + nc, cand]
+    conf, cls = best[cand], cls[cand]
+
+    order = np.argsort(-conf)
+    shift = cls.astype(np.float64) * CLASS_OFFSET
+    boxes = np.stack([cx + shift, cy + shift, w, h, angle], axis=1)  # xywhr, offset centres
+    suppressed = np.zeros(len(order), dtype=bool)
+    for a in range(len(order)):
+        for b in range(a + 1, len(order)):
+            if not suppressed[b] and probiou(boxes[order[a]], boxes[order[b]]) > iou_thres:
+                suppressed[b] = True
+    picked = order[~suppressed][:MAX_DET]
+    return np.column_stack([cx[picked], cy[picked], w[picked], h[picked],
+                            conf[picked], cls[picked].astype(np.float64), angle[picked]])
+
+
+def xywhr2xyxyxyxy(x: np.ndarray) -> np.ndarray:
+    """(N, 5) xywhr -> (N, 4, 2) corner points (ultralytics `xywhr2xyxyxyxy`)."""
+    cos, sin = np.cos(x[:, 4]), np.sin(x[:, 4])
+    vec1 = np.stack([x[:, 2] / 2 * cos, x[:, 2] / 2 * sin], axis=1)
+    vec2 = np.stack([-x[:, 3] / 2 * sin, x[:, 3] / 2 * cos], axis=1)
+    ctr = x[:, :2]
+    return np.stack([ctr + vec1 + vec2, ctr + vec1 - vec2,
+                     ctr - vec1 - vec2, ctr - vec1 + vec2], axis=1)
 
 
 def decode_standard(pred: np.ndarray, nc: int | None = None,
@@ -215,10 +308,56 @@ def decode_standard(pred: np.ndarray, nc: int | None = None,
     return rows
 
 
+def postprocess_obb(raw: np.ndarray, layout: str, names: list[str], w: int, h: int,
+                    new_w: int, new_h: int, left: int, top: int) -> list[dict]:
+    """Decode an OBB output into detections with xywhr/corners in source-image pixels.
+
+    Geometry mirrors ultralytics: the `xywh` branch of `scale_boxes` (padding off the
+    centre, per-axis gains, NO clipping) and `xywhr2xyxyxyxy` for the corners; `x1..y2`
+    is the minimal axis-aligned box enclosing the rotated one.
+    """
+    if layout == "end2end-obb":
+        dets = raw[0]
+        if dets[:, 4].max() > 1.0:
+            raise ValueError("end2end confidences above 1.0; wrong output tensor selected?")
+        dets = dets[dets[:, 4] > CONF_THRES][:MAX_DET]
+    else:  # standard-obb
+        nc = raw.shape[1] - 5
+        if nc != len(names):
+            raise ValueError(f"obb channel split gives nc={nc} but metadata names has {len(names)}")
+        dets = decode_standard_obb(raw[0], nc=nc)
+    if len(dets) == 0:
+        return []
+
+    gain_x, gain_y = new_w / w, new_h / h
+    rboxes = dets[:, [0, 1, 2, 3, 6]].astype(np.float64).copy()  # cx cy w h angle
+    rboxes[:, 0] = (rboxes[:, 0] - left) / gain_x
+    rboxes[:, 1] = (rboxes[:, 1] - top) / gain_y
+    rboxes[:, 2] /= gain_x
+    rboxes[:, 3] /= gain_y
+    corners = xywhr2xyxyxyxy(rboxes)
+
+    out = []
+    for rbox, pts, row in zip(rboxes, corners, dets):
+        cid = int(round(float(row[5])))
+        out.append({
+            "x1": round(float(pts[:, 0].min()), 2),
+            "y1": round(float(pts[:, 1].min()), 2),
+            "x2": round(float(pts[:, 0].max()), 2),
+            "y2": round(float(pts[:, 1].max()), 2),
+            "confidence": round(float(row[4]), 6),
+            "class_id": cid,
+            "class_name": names[cid] if 0 <= cid < len(names) else f"class_{cid}",
+            "xywhr": [round(float(v), 4) for v in rbox[:4]] + [round(float(rbox[4]), 6)],
+            "corners": [[round(float(x), 2), round(float(y), 2)] for x, y in pts],
+        })
+    return out
+
+
 def postprocess(raw: np.ndarray, layout: str, names: list[str], w: int, h: int,
                 new_w: int, new_h: int, left: int, top: int,
                 kpt_shape: tuple[int, int] | None = None) -> list[dict]:
-    if layout in ("end2end", "end2end-pose"):
+    if layout in ("end2end", "end2end-pose", "end2end-obb"):
         dets = raw[0]
         if dets[:, 4].max() > 1.0:
             raise ValueError("end2end confidences above 1.0; wrong output tensor selected?")
@@ -279,11 +418,18 @@ def postprocess(raw: np.ndarray, layout: str, names: list[str], w: int, h: int,
 def draw(img: np.ndarray, dets: list[dict]) -> np.ndarray:
     vis = img.copy()
     for d in dets:
-        p1 = (int(round(d["x1"])), int(round(d["y1"])))
-        p2 = (int(round(d["x2"])), int(round(d["y2"])))
-        cv2.rectangle(vis, p1, p2, (0, 255, 0), 2)
         label = f"{d['class_name']} {d['confidence']:.2f}"
-        cv2.putText(vis, label, (p1[0], max(p1[1] - 6, 12)),
+        corners = d.get("corners")
+        if corners:  # obb: draw the rotated box
+            pts = np.array(corners, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(vis, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+            anchor = (int(pts[:, 0, 0].min()), int(pts[:, 0, 1].min()))
+        else:
+            p1 = (int(round(d["x1"])), int(round(d["y1"])))
+            p2 = (int(round(d["x2"])), int(round(d["y2"])))
+            cv2.rectangle(vis, p1, p2, (0, 255, 0), 2)
+            anchor = p1
+        cv2.putText(vis, label, (anchor[0], max(anchor[1] - 6, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
         for kx, ky, kv in d.get("keypoints", []):
             color = (0, 200, 0) if kv >= 0.5 else (160, 160, 160)  # green / grey
@@ -299,24 +445,32 @@ def infer(image_path: Path, session: ort.InferenceSession, names: list[str], tas
         raise FileNotFoundError(f"cannot read image: {image_path}")
     h, w = img.shape[:2]
 
-    lb, new_w, new_h, left, top = letterbox(img)
+    input_shape = session.get_inputs()[0].shape  # (N, C, H, W); dynamic dims are not ints
+    imgsz = ((int(input_shape[2]), int(input_shape[3]))
+             if len(input_shape) == 4 and isinstance(input_shape[2], int)
+             and isinstance(input_shape[3], int) else IMGSZ)
+    lb, new_w, new_h, left, top = letterbox(img, imgsz)
     x = preprocess(lb)
     out_names = [o.name for o in session.get_outputs()]
     raw = session.run(["output0"] if "output0" in out_names else None, {session.get_inputs()[0].name: x})[0]
     raw = np.asarray(raw, dtype=np.float32)
     layout = detect_layout(raw.shape, task, kpt_shape, len(names))
 
-    dets = postprocess(raw, layout, names, w, h, new_w, new_h, left, top, kpt_shape)
+    if layout.endswith("obb"):
+        dets = postprocess_obb(raw, layout, names, w, h, new_w, new_h, left, top)
+    else:
+        dets = postprocess(raw, layout, names, w, h, new_w, new_h, left, top, kpt_shape)
     return img, raw, layout, dets, (new_w, new_h, left, top)
 
 
 def run(image_path: Path, session: ort.InferenceSession, names: list[str], task: str = "detect",
-        kpt_shape: tuple[int, int] | None = None) -> dict:
+        kpt_shape: tuple[int, int] | None = None, stem_prefix: str | None = None) -> dict:
     img, raw, layout, dets, (new_w, new_h, left, top) = infer(
         image_path, session, names, task, kpt_shape)
     h, w = img.shape[:2]
 
-    stem = f"pose_{image_path.stem}" if task == "pose" else image_path.stem
+    prefix = stem_prefix if stem_prefix is not None else (task if task != "detect" else "")
+    stem = f"{prefix}_{image_path.stem}" if prefix else image_path.stem
     np.save(ASSETS / f"raw_{stem}.npy", raw)
 
     payload = {
@@ -333,6 +487,8 @@ def run(image_path: Path, session: ort.InferenceSession, names: list[str], task:
     if kpt_shape is not None:  # pose
         payload["meta"]["task"] = task
         payload["meta"]["kpt_shape"] = list(kpt_shape)
+    elif task != "detect":
+        payload["meta"]["task"] = task
     (ASSETS / f"reference_{stem}.json").write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     cv2.imwrite(str(ASSETS / f"overlay_{stem}.jpg"), draw(img, dets))
@@ -417,10 +573,12 @@ def verify_e2e() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate golden reference detections from ONNX exports.")
-    parser.add_argument("--task", choices=("detect", "pose"), default="detect",
+    parser.add_argument("--task", choices=("detect", "pose", "obb"), default="detect",
                         help="golden set to regenerate (default: detect)")
     parser.add_argument("--model", type=Path, default=None,
-                        help="ONNX model path (default: yolo26n.onnx / yolo26n-pose.onnx)")
+                        help="ONNX model path (default: yolo26n.onnx / yolo26n-pose.onnx / "
+                             "yolo26n-obb.onnx); with --task obb a custom model changes the "
+                             "output prefix to obb_<family>, e.g. obb_yolo11n_boats.json")
     parser.add_argument("--verify-e2e", action="store_true",
                         help="decode yolo26n-pose-e2e.onnx and diff it against the pose goldens")
     args = parser.parse_args()
@@ -438,10 +596,16 @@ def main() -> None:
     kpt_shape = load_kpt_shape(session) if args.task == "pose" else None
     if args.task == "pose" and kpt_shape is None:
         raise SystemExit(f"{model_path.name}: no 'kpt_shape' metadata, not a pose export?")
+    # a non-default obb model gets its family name in the prefix so the goldens of
+    # yolo26n-obb.onnx (end2end) and yolo11n-obb.onnx (standard) do not collide
+    stem_prefix = None
+    if args.task == "obb" and args.model is not None:
+        stem_prefix = f"obb_{model_path.stem.split('-')[0]}"
     print(f"model={model_path.name} outputs={[o.name for o in session.get_outputs()]} "
           f"names={len(names)} first={names[:3]} kpt_shape={kpt_shape}")
-    for img_name in IMAGES:
-        run(ASSETS / img_name, session, names, args.task, kpt_shape)
+    images = OBB_IMAGES if args.task == "obb" else IMAGES
+    for img_name in images:
+        run(ASSETS / img_name, session, names, args.task, kpt_shape, stem_prefix)
 
 
 if __name__ == "__main__":

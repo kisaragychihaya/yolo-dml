@@ -11,6 +11,11 @@
 //! `1 x (4 + nc + K*D) x anchors` ([`decode_pose`]) and the end-to-end one `1 x N x (6 + K*D)`
 //! ([`decode_pose_end2end`]). Both share the box NMS of the detect path — the keypoints of a
 //! surviving candidate are carried along by its index (see [`nms_indices`]).
+//!
+//! OBB models append one angle channel instead: the standard export is `1 x (4 + nc + 1) x
+//! anchors` ([`decode_obb`]) and the end-to-end one `1 x N x 7` with `cx cy w h conf cls angle`
+//! rows ([`decode_obb_end2end`]). Their NMS is rotated: probabilistic IoU ([`probiou`]) with
+//! the `fast_nms` semantics of [`nms_rotated`].
 
 use crate::detector::{Detection, Keypoint, Obb};
 use crate::error::{Error, Result};

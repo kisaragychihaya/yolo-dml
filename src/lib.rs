@@ -483,7 +483,7 @@ unsafe fn tensor_views<'a>(
 /// Use this when the ONNX session runs in the caller (any runtime): the DLL only does the
 /// decoding, confidence filtering and NMS. `tensors` must hold the model's outputs in the layout
 /// described by the loaded model — one tensor for a single-output export (routed by shape,
-/// pose included) or the four `torchvision` tensors, matched by name first and by shape
+/// pose and obb included) or the four `torchvision` tensors, matched by name first and by shape
 /// otherwise. `src_width`/`src_height` are the **source image** dimensions: the letterbox
 /// geometry is rebuilt from them and from the model's input size, so the caller's preprocessing
 /// must match this library's letterbox (aspect-preserving resize into `input_width x

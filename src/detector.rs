@@ -362,9 +362,10 @@ fn parse_imgsz(raw: &str) -> Option<(u32, u32)> {
 /// [`Session::outputs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputLayout {
-    /// A single output tensor: either the standard `1 x (4 + nc) x anchors` export or the
-    /// end-to-end `1 x N x 6` one, told apart by shape in [`postprocess::decode_output`]. The
-    /// `iou` argument of the detect entry points is honoured here.
+    /// A single output tensor: the standard `1 x (4 + nc [+ K*D | + 1]) x anchors` export or
+    /// the end-to-end `1 x N x (6 | 6 + K*D | 7)` one, told apart by shape in
+    /// [`postprocess::decode_output`] / [`postprocess::decode_obb_output`]. The `iou` argument
+    /// of the detect entry points is honoured by the standard decoders only.
     Single,
     /// Four tensors in the `torchvision` `PostprocessDetections` style, with the NMS already
     /// applied by the graph: `num_detections` `1 x 1`, `detection_boxes` `1 x N x 4`,
@@ -1233,7 +1234,8 @@ impl Detector {
     /// [`preprocess::letterbox_params`], i.e. exactly the mapping [`Self::detect_file`] uses.
     ///
     /// `tensors` follows the model's output layout: one tensor for `OutputLayout::Single` (decoded
-    /// by shape, pose included) or the four `torchvision` tensors for `OutputLayout::NmsApplied`.
+    /// by shape, pose and obb included) or the four `torchvision` tensors for
+    /// `OutputLayout::NmsApplied`.
     /// The four are matched by the names the model declares, then by role names, then by shape
     /// (see [`select_four_views`]). `conf`/`iou` `<= 0` select the same defaults as the FFI.
     ///

@@ -4,16 +4,17 @@
 [![Release](https://img.shields.io/github/v/release/kisaragychihaya/yolo-dml?label=release)](https://github.com/kisaragychihaya/yolo-dml/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Rust 编写的 YOLO DLL：OpenCV 做图像预处理（letterbox），ONNX Runtime **DirectML**（GPU 加速，自动回退 CPU）做推理，导出 C ABI，任意语言可绑定。支持**目标检测**与**姿态估计（pose）**两种任务，算法流程与 ultralytics Python 实现逐行对齐，并用官方参考输出做了数值级验证。
+Rust 编写的 YOLO DLL：OpenCV 做图像预处理（letterbox），ONNX Runtime **DirectML**（GPU 加速，自动回退 CPU）做推理，导出 C ABI，任意语言可绑定。支持**目标检测**、**姿态估计（pose）**与**旋转框检测（OBB）**三种任务，算法流程与 ultralytics Python 实现逐行对齐，并用官方参考输出做了数值级验证。
 
 ## 特性
 
-- 支持目标检测（detect）与姿态估计（pose）两类任务，按模型 metadata 的 `task` / `kpt_shape` 自动判定
-- 支持三类导出布局（detect / pose 各对应两种单输出布局）：
-  - **end2end**：输出 `(1, N, 6)`（模型已内置 NMS，如 `yolo26n.onnx`；ultralytics `yolo export nms=True` 也是此格式）；pose 版为 `(1, N, 6+K*D)`
-  - **标准格式**：输出 `(1, 4+nc, anchors)`（DLL 内部完成置信度过滤 + 类感知 NMS，兼容 YOLOv8/v11/v26 常规导出）；pose 版为 `(1, 4+nc+K*D, anchors)`
+- 支持目标检测（detect）、姿态估计（pose）与旋转框检测（obb）三类任务，按模型 metadata 的 `task` / `kpt_shape` 自动判定
+- 支持三类导出布局（detect / pose / obb 各对应两种单输出布局）：
+  - **end2end**：输出 `(1, N, 6)`（模型已内置 NMS，ultralytics `yolo export nms=True` 即此格式）；pose 版为 `(1, N, 6+K*D)`；obb 版为 `(1, N, 7)`，行格式 `cx cy w h conf cls angle`（注意：与 detect 的 xyxy 不同，旋转头解码恒为 xywh）
+  - **标准格式**：输出 `(1, 4+nc, anchors)`（DLL 内部完成置信度过滤 + 类感知 NMS，兼容 YOLOv8/v11/v26 常规导出）；pose 版为 `(1, 4+nc+K*D, anchors)`；obb 版为 `(1, 4+nc+1, anchors)`（末通道为弧度角度）
   - **torchvision 四输出**：图内带 `NonMaxSuppression` 算子的导出（`num_detections` / `detection_boxes` / `detection_scores` / `detection_classes` 四个输出），DLL 内部完成解码与坐标反算（仅 detect）
 - pose 关键点（`(x, y)` 或 `(x, y, visibility)`，即 `kpt_shape` 的 `D=2/3`）与检测框走同一套几何反算与裁剪，NMS 与 detect 完全相同（关键点随候选一起被保留/抑制）
+- OBB 输出 `xywhr`（中心点/宽高/弧度角）与四个角点；NMS 为 probIoU（ultralytics `batch_probiou`）+ `fast_nms` 语义（被抑制的高分框仍参与抑制），角度通道随候选一起被保留/抑制；v8/v11 与 yolo26 导出的角度都已是弧度，解码端无需再做 sigmoid 映射
 - NMS 为 SoA + 行扫描实现（无新依赖，IoU 是 broadcast+elementwise 而非 GEMM，矩阵库无收益）：候选 N=5000 时约 2.2ms（朴素 AoS 3.5ms），语义与 ultralytics 贪心 NMS 逐位一致（144 组随机配置对照验证，见 `cargo run --release --example bench_nms`）
 - LetterBox 缩放/114 灰边/中心对齐、BGR→RGB、CHW、÷255，与 ultralytics `LetterBox` 完全一致
 - 坐标反算采用 `scale_boxes` 的 X/Y 独立增益（gain_x/gain_y），任意宽高比无亚像素误差；关键点与检测框共用同一映射
@@ -29,13 +30,16 @@ Rust 编写的 YOLO DLL：OpenCV 做图像预处理（letterbox），ONNX Runtim
 │   ├── onnxruntime-dml/     # onnxruntime.dll 1.20.1 + DirectML.dll 1.15.2（NuGet 解包）
 │   ├── opencv/              # OpenCV 4.10.0 官方 Windows 预编译包（仅保留 build/{include,x64/vc16}）
 │   └── clang-stub/          # clang.exe 垫片（build 机专用，换机器需用 rustc 重生成，见文件头注释）
-├── assets/                  # 测试图、黄金参考 JSON/叠图、dll 输出
+├── assets/                  # 测试图（bus/zidane/boats）、黄金参考 JSON/叠图、dll 输出
 ├── examples/
-│   ├── demo.py              # ctypes 全链路演示（--pose 演示姿态估计）
-│   └── compare_reference.py # DLL 输出 vs 黄金参考 对比工具（含关键点比较）
+│   ├── demo.py              # ctypes 全链路演示（--pose 姿态估计，--obb 旋转框）
+│   └── compare_reference.py # DLL 输出 vs 黄金参考 对比工具（含关键点/旋转框比较）
 ├── py/                      # uv venv（onnxruntime/opencv-python/libclang），生成参考用
-├── yolo26n.onnx             # 测试模型（end2end，COCO80）
+├── yolo26n.onnx             # 测试模型（detect，COCO80）
 ├── yolo26n-pose.onnx        # 测试模型（pose，标准布局，COCO 17 关键点 x3）
+├── yolo26n-obb.onnx         # 测试模型（obb，标准布局，DOTA 15 类，1024 输入）
+├── yolo26n-obb-e2e.onnx     # 测试模型（obb，end2end (1,N,7)，同上模型 nms=True 导出）
+├── yolo11n-obb.onnx         # 测试模型（obb，标准布局，v11 角度头）
 └── ultralytics/             # 官方源码（只读参考，未改动）
 ```
 
@@ -46,7 +50,7 @@ Rust 编写的 YOLO DLL：OpenCV 做图像预处理（letterbox），ONNX Runtim
 ```bash
 cargo build            # debug → target/debug/yolo_dml.dll
 cargo build --release  # release → target/release/yolo_dml.dll（推理更快，建议交付用）
-cargo test             # 43 个测试（含真实模型的 detect / pose 黄金门集成测试）
+cargo test             # 52 个测试（含真实模型的 detect / pose / obb 黄金门集成测试）
 ```
 
 `build.rs` 会自动把 `onnxruntime.dll`、`DirectML.dll`、`opencv_world4100.dll` 等 7 个运行时 DLL 拷到 `target/<profile>/`。
@@ -126,7 +130,22 @@ pose 模型（`meta.task = "pose"`）每个 detection 多一个 `keypoints` 字�
 }
 ```
 
-坐标均为原图像素（左上角原点），裁剪到图像边界（与 ultralytics `clip_boxes` 一致，上界为 width/height）；关键点使用与检测框完全相同的 pad/gain 反算与裁剪。`meta.task` 对 detect 模型也会输出（`"detect"`），是向后兼容的新字段。
+OBB 模型（`meta.task = "obb"`）每个 detection 多 `xywhr`（`[cx, cy, w, h, angle]`，angle 为弧度）与 `corners`（旋转框四个角点）两个字段；`x1..y2` 为旋转框的最小轴对齐外接框：
+
+```json
+{
+  "count": 1,
+  "detections": [
+    {"x1": 589.51, "y1": 794.04, "x2": 648.55, "y2": 906.27,
+     "confidence": 0.867, "class_id": 1, "class_name": "ship",
+     "xywhr": [619.03, 850.155, 33.136, 107.341, -0.254],
+     "corners": [[648.55, 897.94], [621.58, 794.04], [589.51, 802.37], [616.48, 906.27]]}
+  ],
+  "meta": {"width": 1920, "height": 1080, "device": "dml", "inference_ms": 20.1, "task": "obb"}
+}
+```
+
+坐标均为原图像素（左上角原点）。detect/pose 的框与关键点裁剪到图像边界（与 ultralytics `clip_boxes` 一致，上界为 width/height）；**OBB 不裁剪**（与 ultralytics `scale_boxes` 的 xywh 分支一致，旋转框可以越出图像边界）。`meta.task` 对 detect 模型也会输出（`"detect"`），是向后兼容的新字段。
 
 ## 验证
 
@@ -141,17 +160,22 @@ py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_zidane.json
 py/.venv/Scripts/python.exe examples/demo.py --pose
 py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_pose_bus.json assets/reference_pose_bus.json
 py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_pose_zidane.json assets/reference_pose_zidane.json
+
+# 旋转框（boats.jpg）：probIoU 匹配 + 角度（0.02 rad）与角点（2px）容差对比
+py/.venv/Scripts/python.exe examples/demo.py --obb
+py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_obb_boats.json assets/reference_obb_boats.json
 ```
 
-当前结果：detect 两图全 PASS（IoU 0.993~1.0，置信度差 ≤0.0003）；pose 两图同样 PASS（关键点最大偏差 <1px，可见度差 <0.01）。黄金参考由 `py/gen_reference.py` 独立生成（onnxruntime+opencv+numpy，同样严格对齐 ultralytics 算法）。
+当前结果：detect 两图全 PASS（IoU 0.993~1.0，置信度差 ≤0.0003）；pose 两图同样 PASS（关键点最大偏差 <1px，可见度差 <0.01）；obb 166 个检测全 PASS（probIoU ≥0.999，角度差 <0.001 rad，角点差 <0.1px）。黄金参考由 `py/gen_reference.py` 独立生成（onnxruntime+opencv+numpy，同样严格对齐 ultralytics 算法）。
 
 ## 已知限制
 
-- 支持 detect 与 pose 两类任务；静态 batch 必须为 1（动态 batch 按 1 处理）
+- 支持 detect、pose 与 obb 三类任务；静态 batch 必须为 1（动态 batch 按 1 处理）
 - pose 模型的关键点形状优先取 metadata `kpt_shape`；缺 metadata 时只有 COCO person 两种形状能识别——`(1, 56, A)`（标准，K=17/D=3/nc=1）与 `(1, N, 57)`（end2end）。其他 K/D 组合必须保留 `kpt_shape` 元数据
-- torchvision 四输出布局**只支持 detect**；pose 模型若导出成四输出，`yolo_create` 直接报错而不是静默丢掉关键点
+- obb 模型依赖 metadata `task: "obb"` 判定（其标准输出 `(1, 4+nc+1, A)` 与 detect `(1, 4+nc', A)` 形状上无法区分）；`yolo export` 会写入该字段，手工剥离 metadata 的 obb 模型会被当作 detect 解码
+- torchvision 四输出布局**只支持 detect**；pose/obb 模型若导出成四输出，`yolo_create` 直接报错而不是静默丢掉关键点/角度
 - 输入张量限 float32 NCHW 3 通道（YOLO 标准输入）
-- **图内已带 NMS 的模型**（end2end `(1,N,6)` 与 torchvision 四输出）：`iou` 参数完全无效（NMS 已按导出时阈值在图内完成），`conf` 只能往严格调
+- **图内已带 NMS 的模型**（end2end `(1,N,6)` / `(1,N,7)` 与 torchvision 四输出）：`iou` 参数完全无效（NMS 已按导出时阈值在图内完成），`conf` 只能往严格调
 - 图内含 `NonMaxSuppression` 算子的模型在 DirectML 下会话创建成功，但该算子及其尾巴会**静默回退 CPU 执行**（ORT 分区行为），`meta.device` 仍显示 `dml`；对纯 CPU 机器无影响
 - 标准格式输出的 NMS 未实现 ultralytics 的 `max_nms=30000` 上限裁剪（8400 anchors 远低于此，无实际影响）
 - 上下文类名解析按 `,` 分割，类名本身含逗号会被切错（ultralytics 官方模型无此情况）
@@ -179,17 +203,18 @@ cargo build --release
 ## 运行测试与演示
 
 ```powershell
-# 下载测试图（ultralytics/assets v0.0.0）并导出 yolo26n.onnx / yolo26n-pose.onnx
-# （首次会装 CPU 版 torch + ultralytics）
+# 下载测试图（ultralytics/assets v0.0.0）并导出 yolo26n.onnx / yolo26n-pose.onnx /
+# yolo26n-obb.onnx / yolo26n-obb-e2e.onnx / yolo11n-obb.onnx（首次会装 CPU 版 torch + ultralytics）
 powershell -ExecutionPolicy Bypass -File scripts/fetch-test-assets.ps1
 
-cargo test                                               # 43 个测试
+cargo test                                               # 52 个测试
 py/.venv/Scripts/python.exe examples/demo.py --release    # ctypes 全链路演示（detect）
 py/.venv/Scripts/python.exe examples/demo.py --release --pose   # 姿态估计演示（画关键点）
+py/.venv/Scripts/python.exe examples/demo.py --release --obb    # 旋转框演示（boats.jpg，画旋转框）
 py/.venv/Scripts/python.exe examples/compare_reference.py assets/dll_bus.json assets/reference_bus.json
 ```
 
-`scripts/fetch-test-assets.ps1` 同样幂等：图片/模型已存在就跳过，torch / ultralytics 已装就跳过。`assets/reference_*.json` 是随仓库提交的黄金参考，可用 `py/gen_reference.py` 重新生成（确定性，产物与提交的一致）。pose 集成测试（`pose_bus_matches_python_reference`）在 `yolo26n-pose.onnx` 或 `assets/reference_pose_bus.json` 缺失时自动跳过，不影响其他测试。
+`scripts/fetch-test-assets.ps1` 同样幂等：图片/模型已存在就跳过，torch / ultralytics 已装就跳过。`assets/reference_*.json` 是随仓库提交的黄金参考，可用 `py/gen_reference.py` 重新生成（确定性，产物与提交的一致；obb 为 `--task obb`，标准布局用 `--task obb --model yolo11n-obb.onnx`）。pose / obb 集成测试在对应模型或黄金参考缺失时自动跳过，不影响其他测试。
 
 ## 分发说明与第三方许可
 

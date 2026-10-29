@@ -64,6 +64,20 @@ impl Preprocessed {
         let (x2, y2) = self.to_source_point(x2, y2);
         (x1, y1, x2, y2)
     }
+
+    /// Map a network-space center/size box back to source-image pixel coordinates.
+    ///
+    /// This is the `xywh` branch of ultralytics' `scale_boxes`: the padding is subtracted from
+    /// the center only, all four components are divided by their axis gain, and — unlike
+    /// [`Self::to_source_box`] — nothing is clipped to the image.
+    pub fn to_source_xywh(&self, cx: f32, cy: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
+        (
+            (cx - self.pad_x) / self.gain_x,
+            (cy - self.pad_y) / self.gain_y,
+            w / self.gain_x,
+            h / self.gain_y,
+        )
+    }
 }
 
 /// Geometry produced by `ultralytics`' letterbox.
@@ -135,17 +149,26 @@ pub fn geometry(src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> Result<Prepro
 }
 
 /// Decode `image_path` and letterbox it into network input format.
+///
+/// The file is read with `std::fs` and decoded from memory (`imdecode`) instead of
+/// `imread`: OpenCV opens files with the narrow system codepage, which cannot open
+/// paths outside it (e.g. a non-ASCII directory on a Western Windows), while Rust
+/// paths are full Unicode.
 pub fn preprocess_file(image_path: &Path, width: u32, height: u32) -> Result<Preprocessed> {
-    let path = image_path.to_str().ok_or_else(|| {
-        Error::invalid(format!(
-            "image path is not valid UTF-8: {}",
-            image_path.display()
-        ))
+    let bytes = std::fs::read(image_path).map_err(|e| {
+        Error::Io(format!("cannot read image {}: {e}", image_path.display()).into())
     })?;
-    let mat = imgcodecs::imread(path, imgcodecs::IMREAD_COLOR)
-        .map_err(|e| Error::OpenCv(format!("imread({path}) failed: {e}").into()))?;
+    let mat = imgcodecs::imdecode(
+        &opencv::core::Vector::<u8>::from_iter(bytes),
+        imgcodecs::IMREAD_COLOR,
+    )
+        .map_err(|e| {
+            Error::OpenCv(format!("imdecode({}) failed: {e}", image_path.display()).into())
+        })?;
     if mat.empty() {
-        return Err(Error::OpenCv(format!("cannot decode image: {path}").into()));
+        return Err(Error::OpenCv(
+            format!("cannot decode image: {}", image_path.display()).into(),
+        ));
     }
     letterbox_mat(&mat, width, height)
 }

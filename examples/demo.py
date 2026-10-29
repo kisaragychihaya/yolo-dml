@@ -7,10 +7,13 @@ short summary. Run from the repository root:
     python examples/demo.py             # debug build, detect model
     python examples/demo.py --release   # release build, detect model
     python examples/demo.py --pose      # pose model, draws the keypoints too
+    python examples/demo.py --obb       # OBB model, draws the rotated boxes (boats.jpg)
 
 `--pose` loads `yolo26n-pose.onnx` (exported by scripts/fetch-test-assets.ps1) and writes
 `dll_pose_<image>.json` / `dll_overlay_pose_<image>.jpg`, so the detect artefacts stay
-intact. `--model` runs any other exported model instead.
+intact. `--obb` loads `yolo26n-obb.onnx` and writes `dll_obb_*`; the DLL target directory
+can be overridden with YOLO_DML_TARGET when it is not target/<profile>. `--model` runs
+any other exported model instead.
 """
 
 from __future__ import annotations
@@ -23,11 +26,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# absolute(), not resolve(): keep the caller's path spelling — resolve() chases directory
+# junctions, which can turn an ASCII working path into a non-ASCII real one (cv2.imread
+# and the DLLs' file opens cannot handle those).
+ROOT = Path(__file__).absolute().parent.parent
 ASSETS = ROOT / "assets"
 MODEL = ROOT / "yolo26n.onnx"
 POSE_MODEL = ROOT / "yolo26n-pose.onnx"
+OBB_MODEL = ROOT / "yolo26n-obb.onnx"
 IMAGES = ("bus.jpg", "zidane.jpg")
+OBB_IMAGES = ("boats.jpg",)
 CONF = 0.25
 IOU = 0.7
 
@@ -42,7 +50,8 @@ KPT_VISIBLE = 0.5
 
 def load_library(release: bool) -> ctypes.CDLL:
     profile = "release" if release else "debug"
-    dll = ROOT / "target" / profile / "yolo_dml.dll"
+    target = Path(os.environ.get("YOLO_DML_TARGET", ROOT / "target"))
+    dll = target / profile / "yolo_dml.dll"
     if not dll.is_file():
         sys.exit(f"missing {dll}; run `cargo build{' --release' if release else ''}` first")
 
@@ -104,16 +113,24 @@ def detect_file(lib: ctypes.CDLL, handle: int, image: Path) -> dict:
 
 def draw(image_path: Path, detections: list[dict], out_path: Path) -> None:
     import cv2
+    import numpy as np
 
     img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError(f"cannot read {image_path}")
     for d in detections:
-        p1 = (int(round(d["x1"])), int(round(d["y1"])))
-        p2 = (int(round(d["x2"])), int(round(d["y2"])))
-        cv2.rectangle(img, p1, p2, (0, 255, 0), 2)
         label = f"{d['class_name']} {d['confidence']:.2f}"
-        cv2.putText(img, label, (p1[0], max(p1[1] - 6, 12)),
+        corners = d.get("corners")
+        if corners:  # obb: rotated box
+            pts = np.array(corners, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(img, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+            anchor = (int(pts[:, 0, 0].min()), int(pts[:, 0, 1].min()))
+        else:
+            p1 = (int(round(d["x1"])), int(round(d["y1"])))
+            p2 = (int(round(d["x2"])), int(round(d["y2"])))
+            cv2.rectangle(img, p1, p2, (0, 255, 0), 2)
+            anchor = p1
+        cv2.putText(img, label, (anchor[0], max(anchor[1] - 6, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
         draw_keypoints(cv2, img, d.get("keypoints"))
     if not cv2.imwrite(str(out_path), img):
@@ -144,15 +161,18 @@ def main() -> int:
     ap.add_argument("--release", action="store_true", help="load target/release/yolo_dml.dll")
     ap.add_argument("--pose", action="store_true",
                     help="run yolo26n-pose.onnx and draw the keypoints")
+    ap.add_argument("--obb", action="store_true",
+                    help="run yolo26n-obb.onnx on boats.jpg and draw the rotated boxes")
     ap.add_argument("--model", type=Path, default=None,
                     help="exported .onnx model to run (default: yolo26n.onnx, or yolo26n-pose.onnx "
-                         "with --pose)")
+                         "with --pose, yolo26n-obb.onnx with --obb)")
     args = ap.parse_args()
 
-    model = args.model or (POSE_MODEL if args.pose else MODEL)
+    model = args.model or (POSE_MODEL if args.pose else OBB_MODEL if args.obb else MODEL)
     if not model.is_file():
         sys.exit(f"missing model {model}; run scripts/fetch-test-assets.ps1 first")
-    prefix = "dll_pose" if args.pose else "dll"
+    prefix = "dll_pose" if args.pose else "dll_obb" if args.obb else "dll"
+    images = OBB_IMAGES if args.obb else IMAGES
 
     ensure_cv2()
     lib = load_library(args.release)
@@ -164,7 +184,7 @@ def main() -> int:
     print(f"handle: {handle} model={model.name}")
 
     try:
-        for name in IMAGES:
+        for name in images:
             image = ASSETS / name
             payload = detect_file(lib, handle, image)
             json_path = ASSETS / f"{prefix}_{image.stem}.json"
@@ -179,10 +199,13 @@ def main() -> int:
                   f"inference_ms={meta['inference_ms']}")
             for i, det in enumerate(payload["detections"][:3], 1):
                 keypoints = det.get("keypoints")
+                corners = det.get("corners")
                 summary = dict(det)
                 if keypoints is not None:
                     # keypoint arrays are long: print how many instead of all of them
                     summary["keypoints"] = f"<{len(keypoints)} points>"
+                if corners is not None:
+                    summary["corners"] = "<4 points>"
                 print(f"  top{i}: {json.dumps(summary, ensure_ascii=False)}")
             print(f"  -> {json_path.relative_to(ROOT)}, {overlay.relative_to(ROOT)}")
     finally:

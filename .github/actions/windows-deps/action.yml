@@ -45,4 +45,8 @@ runs:
 
     - name: Regenerate golden references
       shell: pwsh
-      run: py/.venv/Scripts/python.exe py/gen_reference.py
+      run: |
+        py/.venv/Scripts/python.exe py/gen_reference.py
+        py/.venv/Scripts/python.exe py/gen_reference.py --task obb
+        py/.venv/Scripts/python.exe py/gen_reference.py --task obb --model yolo11n-obb.onnx
+        py/.venv/Scripts/python.exe py/gen_reference.py --task obb --model yolo26n-obb-e2e.onnx

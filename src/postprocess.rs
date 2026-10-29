@@ -12,7 +12,7 @@
 //! ([`decode_pose_end2end`]). Both share the box NMS of the detect path — the keypoints of a
 //! surviving candidate are carried along by its index (see [`nms_indices`]).
 
-use crate::detector::{Detection, Keypoint};
+use crate::detector::{Detection, Keypoint, Obb};
 use crate::error::{Error, Result};
 use crate::preprocess::Preprocessed;
 
@@ -348,6 +348,7 @@ pub fn decode_end2end(
             class_id,
             class_name: class_name(class_names, None, class_id),
             keypoints: None,
+            obb: None,
         });
     }
     Ok(detections)
@@ -441,6 +442,7 @@ pub fn decode_nms_applied<C: ClassIndex>(
             class_id,
             class_name: class_name(class_names, None, class_id),
             keypoints: None,
+            obb: None,
         });
     }
     detections.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
@@ -523,6 +525,7 @@ pub fn decode_and_nms(
                 class_id: c.class_id,
                 class_name: class_name(class_names, Some(class_count), c.class_id),
                 keypoints: None,
+                obb: None,
             }
         })
         .collect())
@@ -658,6 +661,7 @@ pub fn decode_pose(
                 class_id: candidate.class_id,
                 class_name: class_name(class_names, Some(class_count), candidate.class_id),
                 keypoints: Some(points[index * kpt.count..(index + 1) * kpt.count].to_vec()),
+                obb: None,
             }
         })
         .collect())
@@ -712,9 +716,282 @@ pub fn decode_pose_end2end(
             class_id,
             class_name: class_name(class_names, None, class_id),
             keypoints: Some(keypoints_from_network(pre, kpt, &row[END2END_COLUMNS..])),
+            obb: None,
         });
     }
     Ok(detections)
+}
+
+/// Column count of an end-to-end OBB (`NMS already applied`) row: `cx cy w h conf cls angle`.
+///
+/// Unlike the detect end-to-end layout the box stays in center/size form: the `dist2rbox` head
+/// decode always produces `xywh`, and neither the graph nor the predictor converts it.
+const OBB_END2END_COLUMNS: usize = 7;
+
+/// One rotated-box candidate while decoding, in network-input coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObbCandidate {
+    pub cx: f32,
+    pub cy: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Rotation in radians, as it comes out of the graph (see [`decode_obb`]).
+    pub angle: f32,
+    pub confidence: f32,
+    pub class_id: i32,
+}
+
+impl ObbCandidate {
+    /// Box with the class offset added to the center, i.e. what rotated NMS actually compares.
+    fn suppression_box(&self) -> (f32, f32, f32, f32, f32) {
+        let shift = self.class_id as f32 * CLASS_OFFSET;
+        (self.cx + shift, self.cy + shift, self.w, self.h, self.angle)
+    }
+}
+
+/// Probabilistic IoU of two `(cx, cy, w, h, angle)` rotated boxes (ultralytics `batch_probiou`).
+///
+/// Models each box as a Gaussian with covariance `[[w²/12, 0], [0, h²/12]]` rotated by `angle`
+/// and derives the IoU from the Bhattacharyya distance; the result is `0` for disjoint boxes
+/// and approaches `1` for identical ones. Angle in radians.
+pub fn probiou(a: (f32, f32, f32, f32, f32), b: (f32, f32, f32, f32, f32)) -> f32 {
+    const EPS: f32 = 1e-7;
+    // `_get_covariance_matrix`: [[a, c], [c, b]] of the rotated Gaussian.
+    let covariance = |r: (f32, f32, f32, f32, f32)| {
+        let var_w = r.2 * r.2 / 12.0;
+        let var_h = r.3 * r.3 / 12.0;
+        let (sin, cos) = r.4.sin_cos();
+        (
+            var_w * cos * cos + var_h * sin * sin,
+            var_w * sin * sin + var_h * cos * cos,
+            (var_w - var_h) * sin * cos,
+        )
+    };
+    let (a1, b1, c1) = covariance(a);
+    let (a2, b2, c2) = covariance(b);
+    let (x1, y1) = (a.0, a.1);
+    let (x2, y2) = (b.0, b.1);
+    let denom = (a1 + a2) * (b1 + b2) - (c1 + c2) * (c1 + c2) + EPS;
+    let t1 = ((a1 + a2) * (y1 - y2) * (y1 - y2) + (b1 + b2) * (x1 - x2) * (x1 - x2)) / denom * 0.25;
+    let t2 = ((c1 + c2) * (x2 - x1) * (y1 - y2)) / denom * 0.5;
+    let det1 = (a1 * b1 - c1 * c1).max(0.0);
+    let det2 = (a2 * b2 - c2 * c2).max(0.0);
+    let t3 = (((a1 + a2) * (b1 + b2) - (c1 + c2) * (c1 + c2))
+        / (4.0 * (det1 * det2).sqrt() + EPS)
+        + EPS)
+        .ln()
+        * 0.5;
+    let bd = (t1 + t2 + t3).clamp(EPS, 100.0);
+    let hd = (1.0 - (-bd).exp() + EPS).sqrt();
+    1.0 - hd
+}
+
+/// Rotated NMS with the semantics of ultralytics' `TorchNMS.fast_nms` (the rotated branch of
+/// `non_max_suppression` uses it with [`probiou`]).
+///
+/// Candidates are sorted by descending confidence; a candidate is suppressed when *any*
+/// higher-ranked candidate — kept or not — overlaps it with probIoU above `iou_threshold`.
+/// Unlike greedy [`nms`], suppressed boxes keep suppressing. Returns the positions of the kept
+/// candidates in descending confidence order, capped at `max_det` (mirrors `i[:max_det]`).
+pub fn nms_rotated(candidates: &[ObbCandidate], iou_threshold: f32, max_det: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| candidates[b].confidence.total_cmp(&candidates[a].confidence));
+    let shifted: Vec<(f32, f32, f32, f32, f32)> =
+        order.iter().map(|&index| candidates[index].suppression_box()).collect();
+
+    let mut suppressed = vec![false; order.len()];
+    for j in 1..order.len() {
+        for i in 0..j {
+            if probiou(shifted[i], shifted[j]) > iou_threshold {
+                suppressed[j] = true;
+                break;
+            }
+        }
+    }
+    let mut kept = Vec::new();
+    for (rank, index) in order.into_iter().enumerate() {
+        if suppressed[rank] {
+            continue;
+        }
+        kept.push(index);
+        if kept.len() >= max_det {
+            break;
+        }
+    }
+    kept
+}
+
+/// Map one decoded OBB candidate to a [`Detection`] in source-image coordinates.
+///
+/// `cx`/`cy`/`w`/`h` go through [`Preprocessed::to_source_xywh`] (padding removed, per-axis
+/// gains, no clipping — the `xywh` branch of ultralytics' `scale_boxes`), the angle passes
+/// through unchanged. `x1..y2` is the minimal axis-aligned box enclosing the rotated one.
+fn obb_detection(
+    pre: &Preprocessed,
+    class_names: &[String],
+    class_count: Option<usize>,
+    candidate: ObbCandidate,
+) -> Detection {
+    let (cx, cy, w, h) = pre.to_source_xywh(candidate.cx, candidate.cy, candidate.w, candidate.h);
+    let obb = Obb {
+        cx,
+        cy,
+        w,
+        h,
+        angle: candidate.angle,
+    };
+    let (x1, y1, x2, y2) = obb.enclosing_box();
+    Detection {
+        x1,
+        y1,
+        x2,
+        y2,
+        confidence: candidate.confidence,
+        class_id: candidate.class_id,
+        class_name: class_name(class_names, class_count, candidate.class_id),
+        keypoints: None,
+        obb: Some(obb),
+    }
+}
+
+/// Decode the standard OBB export: `1 x (4 + nc + 1) x anchors`.
+///
+/// The first `4` channels are the box in `cx cy w h` form, the next `nc` the class scores (the
+/// best one is the confidence, exactly like [`decode_and_nms`]) and the last one the rotation in
+/// radians. The angle needs no further decoding: v8/v11 heads bake `(sigmoid(a) - 0.25) * pi`
+/// into the exported graph, and yolo26 (`OBB26`) heads regress radians directly (their angle
+/// loss supervises the raw value), so every export emits radians.
+///
+/// NMS is [`nms_rotated`] on the class-shifted centers, mirroring the `rotated=True` branch of
+/// ultralytics' `non_max_suppression`.
+pub fn decode_obb(
+    raw: &[f32],
+    shape: &[i64],
+    pre: &Preprocessed,
+    class_names: &[String],
+    conf_threshold: f32,
+    iou_threshold: f32,
+) -> Result<Vec<Detection>> {
+    let (channels, anchors) = match shape {
+        [_, channels, anchors] if *channels >= 6 && *anchors > 0 => {
+            (*channels as usize, *anchors as usize)
+        }
+        _ => {
+            return Err(Error::invalid(format!(
+                "unexpected output shape {shape:?} for the OBB decoder"
+            )))
+        }
+    };
+    let class_count = channels - 5;
+    if raw.len() < channels * anchors {
+        return Err(Error::invalid(format!(
+            "output holds {} values, need {} for shape {shape:?}",
+            raw.len(),
+            channels * anchors
+        )));
+    }
+
+    // Channel-major layout, as in `decode_and_nms`: attribute row `c` starts at `c * anchors`.
+    let mut candidates: Vec<ObbCandidate> = Vec::new();
+    for anchor in 0..anchors {
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_class = 0usize;
+        for class in 0..class_count {
+            let score = raw[(4 + class) * anchors + anchor];
+            if score > best_score {
+                best_score = score;
+                best_class = class;
+            }
+        }
+        if !(best_score > conf_threshold) {
+            continue;
+        }
+        candidates.push(ObbCandidate {
+            cx: raw[anchor],
+            cy: raw[anchors + anchor],
+            w: raw[2 * anchors + anchor],
+            h: raw[3 * anchors + anchor],
+            angle: raw[(4 + class_count) * anchors + anchor],
+            confidence: best_score,
+            class_id: best_class as i32,
+        });
+    }
+
+    let kept = nms_rotated(&candidates, iou_threshold, MAX_DET);
+    Ok(kept
+        .into_iter()
+        .map(|index| obb_detection(pre, class_names, Some(class_count), candidates[index]))
+        .collect())
+}
+
+/// Decode the end-to-end OBB export: `1 x N x 7` rows of `cx cy w h confidence class_id angle`.
+///
+/// The graph already ran (rotated) NMS and picked the top rows, so this only filters by
+/// confidence and caps at [`MAX_DET`] — the same contract as [`decode_end2end`], except the box
+/// stays in `xywh` form (`dist2rbox` never produces corners).
+pub fn decode_obb_end2end(
+    raw: &[f32],
+    pre: &Preprocessed,
+    class_names: &[String],
+    conf_threshold: f32,
+) -> Result<Vec<Detection>> {
+    if raw.len() % OBB_END2END_COLUMNS != 0 {
+        return Err(Error::invalid(format!(
+            "end2end OBB output has {} values, not a multiple of {OBB_END2END_COLUMNS}",
+            raw.len()
+        )));
+    }
+
+    let mut detections = Vec::new();
+    for row in raw.chunks_exact(OBB_END2END_COLUMNS) {
+        if !(row[4] > conf_threshold) {
+            continue;
+        }
+        if detections.len() >= MAX_DET {
+            break;
+        }
+        let class_id = row[5].round() as i32;
+        detections.push(obb_detection(
+            pre,
+            class_names,
+            None,
+            ObbCandidate {
+                cx: row[0],
+                cy: row[1],
+                w: row[2],
+                h: row[3],
+                angle: row[6],
+                confidence: row[4],
+                class_id,
+            },
+        ));
+    }
+    Ok(detections)
+}
+
+/// Decode whichever OBB layout the model produced.
+///
+/// A last dimension of [`OBB_END2END_COLUMNS`] means the end-to-end export (mirroring the
+/// last-dimension-`6` rule of [`decode_output`]); anything else 3-D is the standard
+/// channel-major export. A standard OBB tensor whose anchor count happens to equal `7` is read
+/// as end-to-end — that would need 7 anchors, which no real export has.
+pub fn decode_obb_output(
+    raw: &[f32],
+    shape: &[i64],
+    pre: &Preprocessed,
+    class_names: &[String],
+    conf_threshold: f32,
+    iou_threshold: f32,
+) -> Result<Vec<Detection>> {
+    match shape {
+        [_, _, last] if *last == OBB_END2END_COLUMNS as i64 => {
+            decode_obb_end2end(raw, pre, class_names, conf_threshold)
+        }
+        [_, _, _] => decode_obb(raw, shape, pre, class_names, conf_threshold, iou_threshold),
+        _ => Err(Error::invalid(format!(
+            "unsupported output shape {shape:?}; expected a 3-D (batch, channels, anchors) tensor"
+        ))),
+    }
 }
 
 /// Keypoint layout implied by the output shape alone, for models whose metadata carries no
@@ -1504,5 +1781,185 @@ mod tests {
         let points = dets[0].keypoints.as_ref().unwrap();
         assert_eq!(points.len(), 4);
         assert!(points.iter().all(|point| point.visibility.is_none()));
+    }
+
+    fn obb_candidate(
+        cx: f32,
+        cy: f32,
+        w: f32,
+        h: f32,
+        angle: f32,
+        confidence: f32,
+        class_id: i32,
+    ) -> ObbCandidate {
+        ObbCandidate {
+            cx,
+            cy,
+            w,
+            h,
+            angle,
+            confidence,
+            class_id,
+        }
+    }
+
+    #[test]
+    fn probiou_scores_overlap_and_alignment() {
+        let a = (100.0, 100.0, 40.0, 20.0, 0.0);
+        // identical boxes approach 1 (bounded by eps), disjoint boxes score 0
+        assert!(probiou(a, a) > 0.99, "{}", probiou(a, a));
+        assert!(probiou(a, (500.0, 500.0, 40.0, 20.0, 0.0)) < 1e-3);
+
+        // a half-overlap along x: in the ballpark of the plain IoU (0.6)
+        let overlap = probiou(a, (110.0, 100.0, 40.0, 20.0, 0.0));
+        assert!((overlap - 0.6).abs() < 0.2, "{overlap}");
+        // rotating the second box by 45 degrees lowers the score
+        let rotated = probiou(a, (110.0, 100.0, 40.0, 20.0, std::f32::consts::FRAC_PI_4));
+        assert!(rotated < overlap, "{rotated} vs {overlap}");
+        // a 90-degree rotation of a 2:1 box around the same center drops the score hard
+        let perpendicular = probiou(a, (100.0, 100.0, 40.0, 20.0, std::f32::consts::FRAC_PI_2));
+        assert!(perpendicular < 0.6, "{perpendicular}");
+    }
+
+    #[test]
+    fn nms_rotated_is_class_aware_and_not_greedy() {
+        let candidates = vec![
+            obb_candidate(100.0, 100.0, 40.0, 20.0, 0.0, 0.9, 0),
+            obb_candidate(105.0, 100.0, 40.0, 20.0, 0.0, 0.8, 0), // overlaps #0 -> suppressed
+            obb_candidate(100.0, 100.0, 40.0, 20.0, 0.0, 0.7, 1), // same box, other class: kept
+            obb_candidate(400.0, 400.0, 40.0, 20.0, 0.0, 0.6, 0), // far away: kept
+        ];
+        assert_eq!(nms_rotated(&candidates, 0.7, MAX_DET), vec![0, 2, 3]);
+        assert!(nms_rotated(&[], 0.7, MAX_DET).is_empty());
+
+        // fast_nms semantics: a suppressed box still suppresses. #0 overlaps #1 (suppressed by
+        // #0) and #1 overlaps #2, but #0 does not overlap #2 — greedy NMS would keep #2.
+        let chain = vec![
+            obb_candidate(0.0, 0.0, 40.0, 20.0, 0.0, 0.9, 0),
+            obb_candidate(8.0, 0.0, 40.0, 20.0, 0.0, 0.8, 0),
+            obb_candidate(16.0, 0.0, 40.0, 20.0, 0.0, 0.7, 0),
+        ];
+        let p01 = probiou(chain[0].suppression_box(), chain[1].suppression_box());
+        let p12 = probiou(chain[1].suppression_box(), chain[2].suppression_box());
+        let p02 = probiou(chain[0].suppression_box(), chain[2].suppression_box());
+        assert!(p01 > 0.6 && p12 > 0.6 && p02 <= 0.6, "{p01} {p12} {p02}");
+        assert_eq!(nms_rotated(&chain, 0.6, MAX_DET), vec![0]);
+
+        // descending confidence order, capped at max_det
+        let far = vec![
+            obb_candidate(0.0, 0.0, 10.0, 10.0, 0.0, 0.5, 0),
+            obb_candidate(100.0, 0.0, 10.0, 10.0, 0.0, 0.9, 0),
+            obb_candidate(200.0, 0.0, 10.0, 10.0, 0.0, 0.7, 0),
+        ];
+        assert_eq!(nms_rotated(&far, 0.7, 2), vec![1, 2]);
+    }
+
+    #[test]
+    fn decode_obb_decodes_angle_and_runs_rotated_nms() {
+        let pre = letterboxed_pre();
+        let anchors = 3usize;
+        let channels = 6usize; // 4 box + 1 class + 1 angle
+        let mut raw = vec![0f32; channels * anchors];
+        let mut write = |anchor: usize, cx: f32, cy: f32, w: f32, h: f32, conf: f32, angle: f32| {
+            raw[anchor] = cx;
+            raw[anchors + anchor] = cy;
+            raw[2 * anchors + anchor] = w;
+            raw[3 * anchors + anchor] = h;
+            raw[4 * anchors + anchor] = conf;
+            raw[5 * anchors + anchor] = angle;
+        };
+        write(0, 100.0, 100.0, 40.0, 20.0, 0.9, 0.5);
+        write(1, 105.0, 100.0, 40.0, 20.0, 0.8, 0.5); // overlaps #0 -> suppressed
+        write(2, 400.0, 400.0, 30.0, 30.0, 0.3, -0.25);
+        let dets = decode_obb(&raw, &[1, channels as i64, anchors as i64], &pre, &[], 0.25, 0.7)
+            .unwrap();
+        assert_eq!(dets.len(), 2, "{dets:?}");
+
+        let first = &dets[0];
+        assert!((first.confidence - 0.9).abs() < 1e-6);
+        assert_eq!(first.class_name, "class_0"); // one class, no metadata: no COCO fallback
+        assert!(first.keypoints.is_none());
+        let obb = first.obb.expect("OBB detections carry a rotated box");
+        // scale_boxes' xywh branch: padding off the center, per-axis gains, no clipping
+        assert!((obb.cx - 200.0).abs() < 1e-3, "{obb:?}");
+        assert!((obb.cy - 100.0 / 0.375).abs() < 1e-3, "{obb:?}");
+        assert!((obb.w - 80.0).abs() < 1e-3, "{obb:?}");
+        assert!((obb.h - 20.0 / 0.375).abs() < 1e-3, "{obb:?}");
+        assert_eq!(obb.angle, 0.5);
+        // 100 / 0.375 = 266.67 exceeds the 240px source height and is *not* clipped
+        assert!(obb.cy > 240.0);
+        // x1..y2 encloses the rotated box
+        let (x1, y1, x2, y2) = obb.enclosing_box();
+        assert_eq!((first.x1, first.y1, first.x2, first.y2), (x1, y1, x2, y2));
+        for (cx, cy) in obb.corners() {
+            assert!(cx >= x1 - 1e-3 && cx <= x2 + 1e-3 && cy >= y1 - 1e-3 && cy <= y2 + 1e-3);
+        }
+
+        assert_eq!(dets[1].obb.unwrap().angle, -0.25);
+
+        // malformed shapes are rejected
+        assert!(decode_obb(&raw, &[1, channels as i64], &pre, &[], 0.25, 0.7).is_err());
+        assert!(decode_obb(&raw[..raw.len() - 1], &[1, channels as i64, anchors as i64], &pre, &[], 0.25, 0.7).is_err());
+    }
+
+    #[test]
+    fn decode_obb_end2end_filters_rows_and_keeps_xywh() {
+        let pre = identity_pre();
+        let rows = [
+            (100.0f32, 120.0, 40.0, 20.0, 0.9, 2.0, 0.3),
+            (300.0, 300.0, 30.0, 30.0, 0.1, 0.0, 0.0), // below threshold
+            (500.0, 500.0, 50.0, 10.0, 0.5, 7.0, -0.5),
+        ];
+        let mut raw = Vec::new();
+        for (cx, cy, w, h, conf, class, angle) in rows {
+            raw.extend_from_slice(&[cx, cy, w, h, conf, class, angle]);
+        }
+
+        let dets = decode_obb_end2end(&raw, &pre, &[], 0.25).unwrap();
+        assert_eq!(dets.len(), 2, "{dets:?}");
+        assert_eq!(dets[0].class_id, 2);
+        assert_eq!(dets[0].class_name, "car"); // end2end: no class count, COCO fallback
+        let obb = dets[0].obb.unwrap();
+        assert_eq!(
+            (obb.cx, obb.cy, obb.w, obb.h, obb.angle),
+            (100.0, 120.0, 40.0, 20.0, 0.3)
+        );
+        assert_eq!(dets[1].obb.unwrap().angle, -0.5);
+
+        // a tensor that is not a whole number of rows is rejected
+        assert!(decode_obb_end2end(&raw[..raw.len() - 1], &pre, &[], 0.25).is_err());
+    }
+
+    #[test]
+    fn decode_obb_output_routes_by_shape() {
+        let pre = identity_pre();
+        // end-to-end (1, N, 7): rows cx cy w h conf cls angle
+        let mut e2e = vec![0f32; 14];
+        e2e[0] = 100.0;
+        e2e[1] = 100.0;
+        e2e[2] = 40.0;
+        e2e[3] = 20.0;
+        e2e[4] = 0.9;
+        e2e[5] = 1.0;
+        e2e[6] = 0.7;
+        let dets = decode_obb_output(&e2e, &[1, 2, 7], &pre, &[], 0.25, 0.7).unwrap();
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].obb.unwrap().angle, 0.7);
+
+        // standard (1, 4+nc+1, A), channel-major
+        let anchors = 2usize;
+        let mut standard = vec![0f32; 6 * anchors];
+        standard[0] = 100.0;
+        standard[anchors] = 100.0;
+        standard[2 * anchors] = 40.0;
+        standard[3 * anchors] = 20.0;
+        standard[4 * anchors] = 0.9;
+        standard[5 * anchors] = 0.7;
+        let dets = decode_obb_output(&standard, &[1, 6, anchors as i64], &pre, &[], 0.25, 0.7)
+            .unwrap();
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].obb.unwrap().angle, 0.7);
+
+        assert!(decode_obb_output(&[], &[1, 2], &pre, &[], 0.25, 0.7).is_err());
     }
 }
